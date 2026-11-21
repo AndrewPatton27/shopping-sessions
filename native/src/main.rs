@@ -113,6 +113,51 @@ unsafe fn pack7(p: *const u8, len: usize) -> Option<u64> {
     Some((x << 7) | b8)
 }
 
+/// pack7 of 8 IDs at once: ID i is the n[i] bytes at base + a[i]. Lanes
+/// pack7 rejects are set in the returned mask (their out value is garbage).
+/// Requires 16 readable bytes at each ID start. 256-bit vectors only.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl,avx512bw,avx512vbmi2,avx2")]
+#[inline]
+unsafe fn pack8(base: *const u8, a: &[u32; 8], n: &[u32; 8], out: &mut [u64; 8]) -> u8 {
+    use std::arch::x86_64::*;
+    let av = _mm256_loadu_si256(a.as_ptr() as *const _);
+    let nv = _mm256_loadu_si256(n.as_ptr() as *const _);
+    // 1..=9 bytes
+    let mut slow = !_mm256_cmplt_epu32_mask(_mm256_sub_epi32(nv, _mm256_set1_epi32(1)), _mm256_set1_epi32(9));
+    // byte 8 of each ID, 0 unless it has 9 bytes
+    let b8w = _mm256_i32gather_epi32::<1>(base as *const i32, _mm256_add_epi32(av, _mm256_set1_epi32(8)));
+    let n9 = _mm256_cmpeq_epi32_mask(nv, _mm256_set1_epi32(9));
+    let b8w = _mm256_maskz_and_epi32(n9, b8w, _mm256_set1_epi32(0xFF));
+    slow |= n9 & _mm256_cmpeq_epi32_mask(b8w, _mm256_setzero_si256());
+    let bswap = _mm256_set_epi64x(0x08090A0B0C0D0E0F, 0x0001020304050607, 0x08090A0B0C0D0E0F, 0x0001020304050607);
+    let s64 = |v: u64| _mm256_set1_epi64x(v as i64);
+    let len8 = _mm256_min_epu32(nv, _mm256_set1_epi32(8));
+    let mut bad8: u8 = 0;
+    // an opaque trip count: unrolled, LLVM would merge the halves into zmm
+    for half in 0..std::hint::black_box(2usize) {
+        let pick = |v: __m256i| if half == 0 { _mm256_castsi256_si128(v) } else { _mm256_extracti128_si256::<1>(v) };
+        let raw = _mm256_i32gather_epi64::<1>(base as *const i64, pick(av));
+        let v = _mm256_shuffle_epi8(raw, bswap);
+        let len = _mm256_cvtepu32_epi64(pick(len8));
+        let b8 = _mm256_cvtepu32_epi64(pick(b8w));
+        // m = !0 << (64 - 8 * len) (0 for len 0)
+        let m = _mm256_sllv_epi64(s64(!0), _mm256_sub_epi64(s64(64), _mm256_slli_epi64::<3>(len)));
+        let v = _mm256_and_si256(v, m);
+        let t = _mm256_or_si256(v, _mm256_andnot_si256(m, s64(0x0101_0101_0101_0101)));
+        let zero = _mm256_andnot_si256(t, _mm256_sub_epi64(t, s64(0x0101_0101_0101_0101)));
+        let hib = _mm256_or_si256(_mm256_or_si256(v, b8), zero);
+        let bad = _mm256_test_epi64_mask(hib, s64(0x8080_8080_8080_8080));
+        bad8 |= (bad & 0xF) << (4 * half);
+        let x = _mm256_or_si256(_mm256_srli_epi64::<1>(_mm256_and_si256(v, s64(0x7F00_7F00_7F00_7F00))), _mm256_and_si256(v, s64(0x007F_007F_007F_007F)));
+        let x = _mm256_or_si256(_mm256_srli_epi64::<2>(_mm256_and_si256(x, s64(0x3FFF_0000_3FFF_0000))), _mm256_and_si256(x, s64(0x0000_3FFF_0000_3FFF)));
+        let x = _mm256_or_si256(_mm256_srli_epi64::<4>(_mm256_and_si256(x, s64(0x0FFF_FFFF_0000_0000))), _mm256_and_si256(x, s64(0x0000_0000_0FFF_FFFF)));
+        let k = _mm256_or_si256(_mm256_slli_epi64::<7>(x), b8);
+        _mm256_storeu_si256(out.as_mut_ptr().add(4 * half) as *mut _, k);
+    }
+    slow | bad8
+}
+
 /// Exact key of a non-empty ID (interns other IDs).
 #[inline(always)]
 unsafe fn key_of(p: *const u8, len: usize) -> u64 {
@@ -274,6 +319,58 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     (cm, nm, qm)
 }
 
+/// masks64 in two 32-byte halves through inline asm, for the AVX-512VL path:
+/// with avx512bw enabled LLVM would otherwise fuse the halves into one zmm
+/// compare (the 512-bit frequency license this path avoids).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn masks64_ymm(p: *const u8) -> (u64, u64, u64) {
+    let (c, n, q): (u64, u64, u64);
+    std::arch::asm!(
+        "vmovdqu {a}, ymmword ptr [{p}]",
+        "vmovdqu {b}, ymmword ptr [{p} + 32]",
+        "vpcmpeqb {t}, {a}, {vc}",
+        "vpmovmskb {r0:e}, {t}",
+        "vpcmpeqb {t}, {b}, {vc}",
+        "vpmovmskb {r1:e}, {t}",
+        "shl {r1}, 32",
+        "or {r0}, {r1}",
+        "mov {c}, {r0}",
+        "vpcmpeqb {t}, {a}, {vn}",
+        "vpmovmskb {r0:e}, {t}",
+        "vpcmpeqb {t}, {b}, {vn}",
+        "vpmovmskb {r1:e}, {t}",
+        "shl {r1}, 32",
+        "or {r0}, {r1}",
+        "mov {n}, {r0}",
+        "vpcmpeqb {t}, {a}, {vq}",
+        "vpmovmskb {r0:e}, {t}",
+        "vpcmpeqb {t}, {b}, {vq}",
+        "vpmovmskb {r1:e}, {t}",
+        "shl {r1}, 32",
+        "or {r0}, {r1}",
+        p = in(reg) p,
+        vc = in(ymm_reg) std::arch::x86_64::_mm256_set1_epi8(b',' as i8),
+        vn = in(ymm_reg) std::arch::x86_64::_mm256_set1_epi8(b'\n' as i8),
+        vq = in(ymm_reg) std::arch::x86_64::_mm256_set1_epi8(b'"' as i8),
+        a = out(ymm_reg) _,
+        b = out(ymm_reg) _,
+        t = out(ymm_reg) _,
+        r0 = out(reg) q,
+        r1 = out(reg) _,
+        c = out(reg) c,
+        n = out(reg) n,
+        options(pure, readonly, nostack),
+    );
+    (c, n, q)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn masks64_ymm(p: *const u8) -> (u64, u64, u64) {
+    masks64(p)
+}
+
 /// Calls `row` with the NF fields (start, end offsets from `base`, quotes
 /// stripped) of every well-formed line starting in [lo, hi). Requires
 /// base[hi] == b'\n' and 128 readable bytes after it.
@@ -285,15 +382,33 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
 /// with a quote ends with one: adding qs to the non-separator mask carries
 /// each start quote to its field's separator, which must equal qe << 1.
 #[inline(always)]
-unsafe fn scan<const NF: usize>(base: *const u8, lo: usize, hi: usize, mut row: impl FnMut(&[(usize, usize); NF])) {
+unsafe fn scan<const NF: usize>(base: *const u8, lo: usize, hi: usize, row: impl FnMut(&[(usize, usize); NF])) {
+    scan_w::<NF, false>(base, lo, hi, row)
+}
+
+/// Byte offsets 0..32, for the AVX-512VL field split.
+static IOTA: [u8; 32] = {
+    let mut a = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        a[i] = i as u8;
+        i += 1;
+    }
+    a
+};
+
+/// scan; W: split fields with AVX-512VL/VBMI2 256-bit compress (callers must
+/// check the CPU and run inside a function that enables avx512vl/bw/vbmi2).
+#[inline(always)]
+unsafe fn scan_w<const NF: usize, const W: bool>(base: *const u8, lo: usize, hi: usize, mut row: impl FnMut(&[(usize, usize); NF])) {
     let mut pos = lo;
     while pos < hi {
         let p = base.add(pos);
-        let (c0, n0, q0) = masks64(p);
+        let (c0, n0, q0) = if W { masks64_ymm(p) } else { masks64(p) };
         let (c, n, q) = if n0 != 0 {
             (c0 as u128, n0 as u128, q0 as u128)
         } else {
-            let (c1, n1, q1) = masks64(p.add(64));
+            let (c1, n1, q1) = if W { masks64_ymm(p.add(64)) } else { masks64(p.add(64)) };
             (c0 as u128 | ((c1 as u128) << 64), (n1 as u128) << 64, q0 as u128 | ((q1 as u128) << 64))
         };
         if n == 0 {
@@ -327,6 +442,35 @@ unsafe fn scan<const NF: usize>(base: *const u8, lo: usize, hi: usize, mut row: 
         let mut st = (((c << 1) | 1) & !qs) | (qs << 1);
         let mut en = (sp & !(qe << 1)) | qe;
         let mut f = [(0usize, 0usize); NF];
+        #[cfg(target_arch = "x86_64")]
+        if W {
+            // offsets of the set bits of st / en, in order, by compressing the
+            // byte offsets of each 32-bit quarter (ymm only); each quarter lands
+            // after the previous quarters' count
+            use std::arch::x86_64::*;
+            let mut sb = [0u8; 64];
+            let mut eb = [0u8; 64];
+            let io = _mm256_loadu_si256(IOTA.as_ptr() as *const _);
+            let (mut ns, mut ne) = (0usize, 0usize);
+            for qi in 0..4 {
+                let off = _mm256_add_epi8(io, _mm256_set1_epi8(32 * qi as i8));
+                let (ms, me) = ((st >> (32 * qi)) as u32, (en >> (32 * qi)) as u32);
+                _mm256_storeu_si256(sb.as_mut_ptr().add(ns) as *mut _, _mm256_maskz_compress_epi8(ms, off));
+                _mm256_storeu_si256(eb.as_mut_ptr().add(ne) as *mut _, _mm256_maskz_compress_epi8(me, off));
+                ns = (ns + ms.count_ones() as usize).min(31);
+                ne = (ne + me.count_ones() as usize).min(31);
+            }
+            // the empty asm keeps each offset scalar: LLVM would otherwise
+            // widen these adds to zmm
+            for (k, x) in f.iter_mut().enumerate() {
+                let (mut a, mut e) = (pos + sb[k] as usize, pos + eb[k] as usize);
+                std::arch::asm!("/* {0} {1} */", inout(reg) a, inout(reg) e, options(pure, nomem, nostack, preserves_flags));
+                *x = (a, e);
+            }
+            row(&f);
+            pos = next;
+            continue;
+        }
         for x in f.iter_mut() {
             let a = st.trailing_zeros();
             st &= st - 1;
@@ -752,60 +896,251 @@ unsafe fn rd32(p: *const u8) -> u32 {
     std::ptr::read_unaligned(p as *const u32)
 }
 
-unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
-    let (ws, we) = (cfg.ws, cfg.we);
+/// The CPU has AVX-512 F/VL/BW/VBMI2: the 256-bit compress field split and the
+/// 8-lane batch (ymm registers with k-masks; no 512-bit frequency license).
+fn avx512() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static ON: LazyLock<bool> = LazyLock::new(|| {
+            std::env::var_os("NO_AVX512").is_none()
+                && is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vl")
+                && is_x86_feature_detected!("avx512vbmi2")
+        });
+        *ON
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
 
-    const VIEW: u32 = u32::from_le_bytes(*b"view");
-    const CART: u32 = u32::from_le_bytes(*b"cart");
-    const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
-    scan::<7>(base, lo, hi, |f| {
-        let (a, b) = f[0];
-        if a == b {
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl,avx512bw,avx512vbmi2,avx2,bmi1,bmi2,popcnt,lzcnt")]
+unsafe fn parse_events_512(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
+    parse_events_w::<true>(cfg, base, lo, hi, out)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl,avx512bw,avx512vbmi2,avx2,bmi1,bmi2,popcnt,lzcnt")]
+unsafe fn parse_clicks_512(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u64, out: &mut Parts<CRec>) {
+    parse_clicks_w::<true>(cfg, base, lo, hi, task, out)
+}
+
+unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
+    #[cfg(target_arch = "x86_64")]
+    if avx512() {
+        return parse_events_512(cfg, base, lo, hi, out);
+    }
+    parse_events_w::<false>(cfg, base, lo, hi, out)
+}
+
+unsafe fn parse_clicks(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u64, out: &mut Parts<CRec>) {
+    #[cfg(target_arch = "x86_64")]
+    if avx512() {
+        return parse_clicks_512(cfg, base, lo, hi, task, out);
+    }
+    parse_clicks_w::<false>(cfg, base, lo, hi, task, out)
+}
+
+#[inline(always)]
+unsafe fn parse_events_w<const W: bool>(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
+    if W {
+        // AVX-512VL: rows collect 8 at a time; their ts, ingest_ts, event_id
+        // and user_id columns are parsed 8 lanes at once, then each row is
+        // finished on its own
+        let mut bt = Batch8 { f: [[(0, 0); 7]; 8], ta: [0; 8], tn: [0; 8], ia: [0; 8], inn: [0; 8], ea: [0; 8], en: [0; 8], ua: [0; 8], un: [0; 8], tv: [0; 8], iv: [0; 8], ev: [0; 8], uv: [0; 8], cnt: 0 };
+        scan_w::<7, W>(base, lo, hi, |f| {
+            if f[0].0 == f[0].1 {
+                return;
+            }
+            let i = bt.cnt;
+            *bt.f.get_unchecked_mut(i) = *f;
+            *bt.ta.get_unchecked_mut(i) = f[2].0 as u32;
+            *bt.tn.get_unchecked_mut(i) = (f[2].1 - f[2].0) as u32;
+            *bt.ia.get_unchecked_mut(i) = f[3].0 as u32;
+            *bt.inn.get_unchecked_mut(i) = (f[3].1 - f[3].0) as u32;
+            *bt.ea.get_unchecked_mut(i) = f[0].0 as u32;
+            *bt.en.get_unchecked_mut(i) = (f[0].1 - f[0].0) as u32;
+            *bt.ua.get_unchecked_mut(i) = f[1].0 as u32;
+            *bt.un.get_unchecked_mut(i) = (f[1].1 - f[1].0) as u32;
+            bt.cnt = i + 1;
+            if i == 7 {
+                bt.run(cfg, base, out);
+            }
+        });
+        if bt.cnt > 0 {
+            bt.run(cfg, base, out);
+        }
+        return;
+    }
+    scan_w::<7, W>(base, lo, hi, |f| {
+        if f[0].0 == f[0].1 {
             return;
         }
-        let eid = key_of(base.add(a), b - a);
         let ing = cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX);
-        let mut r = ERec { eid, user: 0, ing, ts: DEAD, pc: 0 };
-        'v: {
-            let (ua, ub) = f[1];
-            let (pa, pb) = f[5];
-            let (ta, tb) = f[4];
-            if ua == ub || pa == pb {
-                break 'v;
-            }
-            let tl = tb - ta;
-            let purchase = tl == 8 && std::ptr::read_unaligned(base.add(ta) as *const u64) == PURCHASE;
-            let w = rd32(base.add(ta));
-            if !purchase & !((tl == 4) & ((w == VIEW) | (w == CART))) {
-                break 'v;
-            }
-            let ts = match cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0) {
-                Some(t) if t >= ws && t < we => t,
-                _ => break 'v,
-            };
-            if ing.saturating_sub(ts) > DAY_MS {
-                break 'v;
-            }
-            if purchase {
-                let price = match parse_price(std::slice::from_raw_parts(base.add(f[6].0), f[6].1 - f[6].0)) {
-                    Some(p) => p,
-                    None => break 'v,
-                };
-                let cat = key_find(base.add(pa), pb - pa).and_then(|k| cfg.products.get(k)).unwrap_or(cfg.unknown_cat);
-                r.pc = (price << 8) | cat;
-            }
-            r.user = key_of(base.add(ua), ub - ua);
-            r.ts = (ts - ws) as u32;
-        }
-        out.push(part_of(mix(eid), cfg.pe_bits), r);
+        event_row(
+            cfg,
+            base,
+            f,
+            key_of(base.add(f[0].0), f[0].1 - f[0].0),
+            ing,
+            || cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0),
+            || key_of(base.add(f[1].0), f[1].1 - f[1].0),
+            out,
+        );
     });
 }
 
+/// Up to 8 event rows (non-empty event_id) waiting for the 8-lane parse:
+/// their fields, and the starts and lengths of ts, ingest_ts, event_id and
+/// user_id.
+struct Batch8 {
+    f: [[(usize, usize); 7]; 8],
+    ta: [u32; 8],
+    tn: [u32; 8],
+    ia: [u32; 8],
+    inn: [u32; 8],
+    ea: [u32; 8],
+    en: [u32; 8],
+    ua: [u32; 8],
+    un: [u32; 8],
+    /// results (kept here: zeroing them per batch compiles to zmm stores)
+    tv: [i64; 8],
+    iv: [i64; 8],
+    ev: [u64; 8],
+    uv: [u64; 8],
+    cnt: usize,
+}
+
+impl Batch8 {
+    #[inline(always)]
+    unsafe fn run(&mut self, cfg: &Cfg, base: *const u8, out: &mut Parts<ERec>) {
+        let n = self.cnt;
+        self.cnt = 0;
+        // unused lanes repeat lane 0 (readable bytes; results ignored)
+        for i in n..8 {
+            self.ta[i] = self.ta[0];
+            self.tn[i] = self.tn[0];
+            self.ia[i] = self.ia[0];
+            self.inn[i] = self.inn[0];
+            self.ea[i] = self.ea[0];
+            self.en[i] = self.en[0];
+            self.ua[i] = self.ua[0];
+            self.un[i] = self.un[0];
+        }
+        let (ts_slow, ing_slow, e_slow, u_slow) = {
+            #[cfg(target_arch = "x86_64")]
+            {
+                (
+                    cfg.cal.parse8(base, &self.ta, &self.tn, false, &mut self.tv),
+                    cfg.cal.parse8(base, &self.ia, &self.inn, true, &mut self.iv),
+                    pack8(base, &self.ea, &self.en, &mut self.ev),
+                    pack8(base, &self.ua, &self.un, &mut self.uv),
+                )
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                (u8::MAX, u8::MAX, u8::MAX, u8::MAX)
+            }
+        };
+        for i in 0..n {
+            let f = &self.f[i];
+            let ing = if (ing_slow >> i) & 1 != 0 {
+                cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX)
+            } else {
+                self.iv[i]
+            };
+            let slow = (ts_slow >> i) & 1 != 0;
+            let t = self.tv[i];
+            let eid = if (e_slow >> i) & 1 != 0 { key_of(base.add(f[0].0), f[0].1 - f[0].0) } else { self.ev[i] };
+            let (us, u) = ((u_slow >> i) & 1 != 0, self.uv[i]);
+            {
+                let want = cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0);
+                let got = if slow { want } else if t == i64::MIN { None } else { Some(t) };
+                let wi = cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0);
+                let gi = if (ing_slow >> i) & 1 != 0 { wi } else { Some(self.iv[i]) };
+                let pe = pack7(base.add(f[0].0), f[0].1 - f[0].0);
+                let pu = pack7(base.add(f[1].0), f[1].1 - f[1].0);
+                let ge = if (e_slow >> i) & 1 != 0 { None } else { Some(self.ev[i]) };
+                let gu = if us { None } else { Some(u) };
+                if want != got || wi != gi || pe != ge || pu != gu {
+                    panic!("XCHECK row {:?}: {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}", String::from_utf8_lossy(std::slice::from_raw_parts(base.add(f[0].0), f[6].1 - f[0].0)), want, got, wi, gi, pe, ge, pu, gu);
+                }
+            }
+            event_row(
+                cfg,
+                base,
+                f,
+                eid,
+                ing,
+                || if slow { cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0) } else if t == i64::MIN { None } else { Some(t) },
+                || if us { key_of(base.add(f[1].0), f[1].1 - f[1].0) } else { u },
+                out,
+            );
+        }
+    }
+}
+
+/// One event row with a non-empty event_id, given its key and ingest time,
+/// its ts parser (called only once the cheaper checks pass) and its user key
+/// (called only for a valid row).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn event_row(
+    cfg: &Cfg,
+    base: *const u8,
+    f: &[(usize, usize); 7],
+    eid: u64,
+    ing: i64,
+    ts: impl FnOnce() -> Option<i64>,
+    user: impl FnOnce() -> u64,
+    out: &mut Parts<ERec>,
+) {
+    const VIEW: u32 = u32::from_le_bytes(*b"view");
+    const CART: u32 = u32::from_le_bytes(*b"cart");
+    const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
+    let (ws, we) = (cfg.ws, cfg.we);
+    let mut r = ERec { eid, user: 0, ing, ts: DEAD, pc: 0 };
+    'v: {
+        let (ua, ub) = f[1];
+        let (pa, pb) = f[5];
+        let (ta, tb) = f[4];
+        if ua == ub || pa == pb {
+            break 'v;
+        }
+        let tl = tb - ta;
+        let purchase = tl == 8 && std::ptr::read_unaligned(base.add(ta) as *const u64) == PURCHASE;
+        let w = rd32(base.add(ta));
+        if !purchase & !((tl == 4) & ((w == VIEW) | (w == CART))) {
+            break 'v;
+        }
+        let ts = match ts() {
+            Some(t) if t >= ws && t < we => t,
+            _ => break 'v,
+        };
+        if ing.saturating_sub(ts) > DAY_MS {
+            break 'v;
+        }
+        if purchase {
+            let price = match parse_price(std::slice::from_raw_parts(base.add(f[6].0), f[6].1 - f[6].0)) {
+                Some(p) => p,
+                None => break 'v,
+            };
+            let cat = key_find(base.add(pa), pb - pa).and_then(|k| cfg.products.get(k)).unwrap_or(cfg.unknown_cat);
+            r.pc = (price << 8) | cat;
+        }
+        r.user = user();
+        r.ts = (ts - ws) as u32;
+    }
+    out.push(part_of(mix(eid), cfg.pe_bits), r);
+}
+
 /// Invalid clicks are kept (camp DEAD): dedup comes before validation.
-unsafe fn parse_clicks(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u64, out: &mut Parts<CRec>) {
+#[inline(always)]
+unsafe fn parse_clicks_w<const W: bool>(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u64, out: &mut Parts<CRec>) {
     let (cs, we) = (cfg.ws - WEEK_MS, cfg.we);
     let mut ord = task << 32;
-    scan::<4>(base, lo, hi, |f| {
+    scan_w::<4, W>(base, lo, hi, |f| {
         let (a, b) = f[0];
         if a == b {
             return;
@@ -2146,10 +2481,10 @@ fn main() {
     let t_e = t0.elapsed();
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
-        "threads {} parts {}/{}/{} | setup {:.0} parse {:.0} dedup+route {:.0} sessions+write {:.0} campaigns {:.0} | total {:.0} ms | user rows {} campaign rows {}",
+        "threads {} parts {}/{}/{} | setup {:.0} parse {:.0} dedup+route {:.0} sessions+write {:.0} campaigns {:.0} | total {:.0} ms | user rows {} campaign rows {} | avx512 {}",
         nt, npe, npc, nq,
         ms(t_setup), ms(t_a - t_setup), ms(t_b - t_a), ms(t_d - t_b), ms(t_e - t_d), ms(t_e),
-        total_rows, merged.len()
+        total_rows, merged.len(), avx512() as u8
     );
     eprintln!("mem (rss/peak/minflt) setup {} parse {} dedup+route {} sessions+write {} end {}", m_setup, m_a, m_b, m_d, mem_now());
     if let Ok(st) = fs::read_to_string("/proc/self/stat") {
