@@ -132,7 +132,7 @@ fn phys(k: Kind) -> i32 {
 impl Writer {
     pub fn create(path: &Path, schema: &[(&'static str, Kind)]) -> io::Result<Writer> {
         let f = File::create(path)?;
-        let mut w = BufWriter::with_capacity(1 << 16, f);
+        let mut w = BufWriter::with_capacity(1 << 22, f);
         w.write_all(b"PAR1")?;
         Ok(Writer { w, pos: 4, schema: schema.to_vec(), rgs: Vec::new() })
     }

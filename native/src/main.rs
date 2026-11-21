@@ -412,6 +412,94 @@ fn load_chunk(f: &mut File, s: u64, e: u64, fsize: u64, buf: &mut Vec<u8>) -> (u
     (lo, hi)
 }
 
+
+#[cfg(target_os = "linux")]
+mod lx {
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    }
+    const PROT_READ: i32 = 1;
+    const MAP_PRIVATE: i32 = 2;
+    const MAP_POPULATE: i32 = 0x8000;
+    const MADV_SEQUENTIAL: i32 = 2;
+    const MADV_HUGEPAGE: i32 = 14;
+    const PAGE: usize = 4096;
+
+    /// Read-only mapping of file bytes [from, to); `ptr` points at byte `from`.
+    pub struct Map {
+        base: *mut u8,
+        len: usize,
+        pub ptr: *const u8,
+        pub n: usize,
+    }
+    impl Drop for Map {
+        fn drop(&mut self) {
+            unsafe { munmap(self.base, self.len) };
+        }
+    }
+
+    pub fn map(f: &std::fs::File, from: u64, to: u64) -> Option<Map> {
+        let al = from & !(PAGE as u64 - 1);
+        let n = (to - from) as usize;
+        let len = n + (from - al) as usize;
+        let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE | MAP_POPULATE, f.as_raw_fd(), al as i64) };
+        if p as isize == -1 || p.is_null() {
+            return None;
+        }
+        unsafe { madvise(p, len, MADV_SEQUENTIAL) };
+        Some(Map { base: p, len, ptr: unsafe { p.add((from - al) as usize) }, n })
+    }
+
+    /// Hint transparent huge pages for the (still untouched) spare capacity of `v`.
+    pub fn hugepage<T>(v: &mut Vec<T>) {
+        let a = v.as_mut_ptr() as usize;
+        let end = a + v.capacity() * std::mem::size_of::<T>();
+        let s = (a + (2 << 20) - 1) & !((2 << 20) - 1);
+        let e = end & !((2 << 20) - 1);
+        if e > s {
+            unsafe { madvise(s as *mut u8, e - s, MADV_HUGEPAGE) };
+        }
+    }
+}
+
+/// Zero-copy chunk load via mmap. Same contract as load_chunk but the data
+/// lives in the returned map (index 0 = file offset rs). None -> use load_chunk
+/// (EOF too close for the 64-byte over-read, or mmap failed).
+#[cfg(target_os = "linux")]
+fn load_chunk_map(f: &File, s: u64, e: u64, fsize: u64) -> Option<(lx::Map, usize, usize)> {
+    if fsize == 0 || s >= e {
+        return None;
+    }
+    let rs = if s == 0 { 0 } else { s - 1 };
+    let rend = (e + 4096).min(fsize);
+    let m = lx::map(f, rs, rend)?;
+    // SAFETY: the mapping covers m.n bytes of the file.
+    let d = unsafe { std::slice::from_raw_parts(m.ptr, m.n) };
+    let lim = (e - 1 - rs) as usize;
+    if lim >= d.len() {
+        return None;
+    }
+    let mut lo = 0usize;
+    if s > 0 {
+        lo = find_nl(&d[..lim])? + 1;
+    }
+    let hi = lim + find_nl(&d[lim..])?;
+    // scan_lines reads up to 64 bytes past hi: they must be real mapped file bytes
+    if hi + 64 >= d.len() {
+        return None;
+    }
+    if s == 0 {
+        lo = match find_nl(&d[..hi]) {
+            Some(i) => i + 1,
+            None => hi,
+        };
+    }
+    Some((m, lo, hi))
+}
+
 fn load_whole(path: &Path, buf: &mut Vec<u8>) -> (usize, usize) {
     let mut f = File::open(path).unwrap_or_else(|e| panic!("open {}: {}", path.display(), e));
     let size = f.metadata().expect("stat").len();
@@ -1427,7 +1515,12 @@ fn main() {
                         ev: (0..npe).map(|_| Vec::with_capacity(res_e)).collect(),
                         ck: (0..npc).map(|_| Vec::with_capacity(res_c)).collect(),
                     };
-                    let mut buf: Vec<u8> = Vec::with_capacity(CHUNK as usize + 8192);
+                    #[cfg(target_os = "linux")]
+                    {
+                        out.ev.iter_mut().for_each(lx::hugepage);
+                        out.ck.iter_mut().for_each(lx::hugepage);
+                    }
+                    let mut buf: Vec<u8> = Vec::new(); // fallback copy path only; grows on demand
                     loop {
                         let i = next.fetch_add(1, AO::Relaxed);
                         if i >= tasks.len() {
@@ -1439,11 +1532,23 @@ fn main() {
                             Kind::Clicks => &ck_files[tk.file],
                         };
                         let mut f = File::open(path).unwrap_or_else(|e| panic!("open {}: {}", path.display(), e));
+                        #[cfg(target_os = "linux")]
+                        let mapped = load_chunk_map(&f, tk.s, tk.e, *size);
+                        #[cfg(target_os = "linux")]
+                        let (base, lo, hi) = match &mapped {
+                            Some((m, lo, hi)) => (m.ptr, *lo, *hi),
+                            None => {
+                                let (lo, hi) = load_chunk(&mut f, tk.s, tk.e, *size, &mut buf);
+                                (buf.as_ptr(), lo, hi)
+                            }
+                        };
+                        #[cfg(not(target_os = "linux"))]
                         let (lo, hi) = load_chunk(&mut f, tk.s, tk.e, *size, &mut buf);
+                        #[cfg(not(target_os = "linux"))]
+                        let base = buf.as_ptr();
                         if lo >= hi || cfg.exp == 9 || (cfg.exp >= 5 && cfg.exp <= 8 && tk.kind == Kind::Clicks) {
                             continue;
                         }
-                        let base = buf.as_ptr();
                         // SAFETY: each slot is written by exactly one task.
                         unsafe {
                             match tk.kind {
