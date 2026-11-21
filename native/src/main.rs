@@ -895,7 +895,7 @@ fn dedup_part(lists: &[&Vec<Vec<DRec>>], p: usize, tab: &mut Vec<u64>, kill: imp
     if n < 2 {
         return;
     }
-    let cap = (n + n / 2).next_power_of_two();
+    let cap = (n * 2).next_power_of_two();
     let mask = cap - 1;
     if tab.len() < cap {
         tab.resize(cap, 0);
