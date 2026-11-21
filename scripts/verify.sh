@@ -4,6 +4,7 @@
 # Run from starter/starter-duckdb: bash scripts/verify.sh
 #   FAST=1  fixtures + dev holdout + invariants only (quick iteration)
 #   META=1  adds metamorphic runs on d1 (shuffle, split, headers, requote, reencode, all)
+#   FUZZ=1  adds byte-level fuzz vs reference.py on seeds 1-50 (scripts/fuzz.py)
 #   BIG=1   adds the big set and TIME line
 # PIPE overrides the command under test, e.g. PIPE=native/target/release/shopping-sessions.exe
 # ORACLE_ROOT overrides the dir that scripts/oracle.sha256 paths are relative to (testing the guard).
@@ -18,6 +19,7 @@ RESULT=""
 if [ "${FAST:-0}" = 1 ]; then MODE=fast; else MODE=full; fi
 [ "${META:-0}" = 1 ] && MODE="$MODE+meta"
 [ "${BIG:-0}" = 1 ] && MODE="$MODE+big"
+[ "${FUZZ:-0}" = 1 ] && MODE="$MODE+fuzz"
 finish() {
   local rc=$? commit dirty
   rm -f "$LOG"
@@ -141,6 +143,15 @@ else
   echo "SKIP seeds: FAST=1"
 fi
 if [ "${META:-0}" = 1 ]; then meta_set; else echo "SKIP meta: META=1 not set"; fi
+
+# fuzz: byte-level CSV/timestamp fuzz vs reference.py, seeds 1-50 (optional)
+if [ "${FUZZ:-0}" = 1 ]; then
+  STEP=fuzz
+  python scripts/fuzz.py --pipe "$PIPE" --seeds 1-50 --workdir "$STRESS/fuzz" >"$LOG" 2>&1 || fail "fuzz: $(grep -m1 'FUZZ FAIL' "$LOG")" fuzz
+  echo "PASS fuzz: 50 seeds"
+else
+  echo "SKIP fuzz: FUZZ=1 not set"
+fi
 
 STEP=done
 echo "VERIFY PASS"
