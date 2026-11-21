@@ -133,7 +133,7 @@ jobs:
           sudo apt-get install -y -q linux-tools-common linux-tools-$(uname -r) > /dev/null 2>&1 || sudo apt-get install -y -q linux-tools-azure > /dev/null 2>&1 || true
           PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); [ -z "$PERF" ] && PERF=perf
           sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
-          (cd native && RUSTFLAGS="-C target-cpu=x86-64-v3 -C debuginfo=1 -C force-frame-pointers=yes" cargo build --release -q --target-dir target-dbg)
+          (cd native && CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=none RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes" cargo build --release -q --target-dir target-dbg)
           BIN=native/target-dbg/release/shopping-sessions
           lscpu | grep -E "Model name|Thread"
           DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/op NCPU=$(nproc) $BIN 2>&1 | grep total
