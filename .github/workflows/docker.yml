@@ -1,0 +1,29 @@
+# Build the scored image on real linux/amd64 and run the fixtures inside it
+# with the scorer's container flags (read-only root, uid 1000, no network).
+name: docker
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile: [Dockerfile, Dockerfile.polars]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install polars==2.0.0 pyarrow==25.0.1
+      - name: Build image
+        run: docker build -f ${{ matrix.dockerfile }} -t shopping-sessions:latest .
+      - name: Fixtures in container
+        env: { CPUS: "4", MEM: "12g" }
+        run: python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
+      - name: Regression cases in container
+        env: { CPUS: "4", MEM: "12g" }
+        run: python scripts/run_fixtures.py regress -- scripts/docker_run.sh
