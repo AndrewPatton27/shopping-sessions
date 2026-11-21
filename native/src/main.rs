@@ -1689,12 +1689,15 @@ fn clean_dir(dir: &Path) {
     }
 }
 
-/// "rss MB / minor faults" now (Linux), for the stage line.
+/// "rss MB / peak rss MB / minor faults" now (Linux), for the stage line.
 fn mem_now() -> String {
     let rss = fs::read_to_string("/proc/self/statm").ok().and_then(|t| t.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok()));
     let flt = fs::read_to_string("/proc/self/stat").ok().and_then(|t| t.rsplit(')').next().and_then(|r| r.split_whitespace().nth(7).and_then(|x| x.parse::<u64>().ok())));
+    let hwm = fs::read_to_string("/proc/self/status").ok().and_then(|t| {
+        t.lines().find(|l| l.starts_with("VmHWM:")).and_then(|l| l.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok()))
+    });
     match (rss, flt) {
-        (Some(r), Some(f)) => format!("{}M/{}", r * 4096 >> 20, f),
+        (Some(r), Some(f)) => format!("{}M/{}M/{}", r * 4096 >> 20, hwm.unwrap_or(0) >> 10, f),
         _ => "-".into(),
     }
 }
@@ -1873,6 +1876,7 @@ fn main() {
                             }
                         }
                         let _ = links.set(build_links(&pairs));
+                        if std::env::var_os("MEMDBG").is_some() { eprintln!("mem after links {}", mem_now()); }
                     }
                     let arena = Arena::leak(slab_a);
                     let mut pe = Parts::<ERec>::new(npe, arena);
@@ -2133,7 +2137,7 @@ fn main() {
         ms(t_setup), ms(t_a - t_setup), ms(t_b - t_a), ms(t_d - t_b), ms(t_e - t_d), ms(t_e),
         total_rows, merged.len()
     );
-    eprintln!("mem (rss/minflt) setup {} parse {} dedup+route {} sessions+write {} end {}", m_setup, m_a, m_b, m_d, mem_now());
+    eprintln!("mem (rss/peak/minflt) setup {} parse {} dedup+route {} sessions+write {} end {}", m_setup, m_a, m_b, m_d, mem_now());
     if let Ok(st) = fs::read_to_string("/proc/self/stat") {
         // minor faults, user and system CPU ticks: how much time the kernel took
         let f: Vec<&str> = st.rsplit(')').next().unwrap_or("").split_whitespace().collect();
