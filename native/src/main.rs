@@ -541,11 +541,12 @@ unsafe impl<T> Send for Ptr<T> {}
 unsafe impl<T> Sync for Ptr<T> {}
 
 /// Bytes per arena chunk: whole 192 B stage groups, and whole records of
-/// every row type (16, 24, 32 B).
-const CH: usize = 128 * STAGE;
+/// every row type (16, 24, 32 B), and three 4 KB pages: small, because each
+/// partition's current chunk is only partly filled (12 KB = lcm of 192 and 4 KB).
+const CH: usize = 64 * STAGE;
 
 /// One thread's chunk source: chunks it has freed first (rows already
-/// consumed), else fresh 64 B aligned chunks carved from big slabs. Reusing
+/// consumed), else fresh page-aligned chunks carved from big slabs. Reusing
 /// consumed chunks spares the kernel zeroing fresh pages, and handing out
 /// chunks on demand replaces per-partition regions sized with headroom.
 /// Slabs are never freed (the process exits without destructors).
@@ -569,10 +570,10 @@ impl Arena {
             return c;
         }
         if self.left < CH {
-            let mut v: Vec<u8> = Vec::with_capacity(self.slab + 64);
+            let mut v: Vec<u8> = Vec::with_capacity(self.slab + 4096);
             let p = v.as_mut_ptr();
             std::mem::forget(v);
-            let off = p.align_offset(64);
+            let off = p.align_offset(4096);
             self.next = unsafe { p.add(off) };
             self.left = self.slab;
         }
