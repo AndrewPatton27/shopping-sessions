@@ -127,3 +127,21 @@ jobs:
           done
           pip install -q polars==2.0.0 pyarrow==25.0.1
           cd scripts && python compare.py /tmp/o_new /tmp/o_old
+      - name: Perf profile (modes contains perf)
+        if: contains(inputs.modes, 'perf')
+        run: |
+          sudo apt-get install -y -q linux-tools-common linux-tools-$(uname -r) > /dev/null 2>&1 || sudo apt-get install -y -q linux-tools-azure > /dev/null 2>&1 || true
+          PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1); [ -z "$PERF" ] && PERF=perf
+          sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          (cd native && RUSTFLAGS="-C target-cpu=x86-64-v3 -C debuginfo=1 -C force-frame-pointers=yes" cargo build --release -q --target-dir target-dbg)
+          BIN=native/target-dbg/release/shopping-sessions
+          lscpu | grep -E "Model name|Thread"
+          DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/op NCPU=$(nproc) $BIN 2>&1 | grep total
+          echo "=== perf stat"
+          DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/op NCPU=$(nproc) $PERF stat -e cycles,instructions,cache-misses,branch-misses,task-clock $BIN 2>&1 | tail -15 || true
+          echo "=== perf record"
+          DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/op NCPU=$(nproc) $PERF record -q -F 1999 -e cpu-clock -o /tmp/perf.data $BIN 2>&1 | grep total || true
+          echo "=== by symbol"
+          $PERF report -i /tmp/perf.data --stdio --no-children --sort sym 2>/dev/null | grep -v "^#" | grep -v "^$" | head -30
+          echo "=== by srcline"
+          timeout 600 $PERF report -i /tmp/perf.data --stdio --no-children --sort srcline 2>/dev/null | grep -v "^#" | grep -v "^$" | head -60
