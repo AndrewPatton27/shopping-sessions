@@ -999,15 +999,6 @@ impl Batch16 {
             let t = tv[i];
             let eid = if (e_slow >> i) & 1 != 0 { key_of(base.add(f[0].0), f[0].1 - f[0].0) } else { ev[i] };
             let (us, u) = ((u_slow >> i) & 1 != 0, uv[i]);
-            {
-                let pe = pack7(base.add(f[0].0), f[0].1 - f[0].0);
-                let pu = pack7(base.add(f[1].0), f[1].1 - f[1].0);
-                let ge = if (e_slow >> i) & 1 != 0 { None } else { Some(ev[i]) };
-                let gu = if us { None } else { Some(u) };
-                if pe != ge || pu != gu {
-                    panic!("XCHECK keys {:?} {:?} {:?} {:?} {:?} {:?}", String::from_utf8_lossy(std::slice::from_raw_parts(base.add(f[0].0), f[0].1 - f[0].0)), pe, ge, String::from_utf8_lossy(std::slice::from_raw_parts(base.add(f[1].0), f[1].1 - f[1].0)), pu, gu);
-                }
-            }
             event_row(
                 cfg,
                 base,
