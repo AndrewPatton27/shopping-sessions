@@ -146,4 +146,4 @@ jobs:
           echo "=== by source line"
           $PERF script -i /tmp/perf.data -F ip,sym,symoff > /tmp/ps.txt 2> /tmp/ps.err || true
           head -3 /tmp/ps.txt; head -3 /tmp/ps.err; wc -l /tmp/ps.txt
-          python3 scripts/perf_lines.py $BIN 70 < /tmp/ps.txt 2>&1 | head -80
+          python3 scripts/perf_lines.py $BIN 50 < /tmp/ps.txt 2>&1 | head -90
