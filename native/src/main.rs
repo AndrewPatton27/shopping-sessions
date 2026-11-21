@@ -1689,6 +1689,16 @@ fn clean_dir(dir: &Path) {
     }
 }
 
+/// "rss MB / minor faults" now (Linux), for the stage line.
+fn mem_now() -> String {
+    let rss = fs::read_to_string("/proc/self/statm").ok().and_then(|t| t.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok()));
+    let flt = fs::read_to_string("/proc/self/stat").ok().and_then(|t| t.rsplit(')').next().and_then(|r| r.split_whitespace().nth(7).and_then(|x| x.parse::<u64>().ok())));
+    match (rss, flt) {
+        (Some(r), Some(f)) => format!("{}M/{}", r * 4096 >> 20, f),
+        _ => "-".into(),
+    }
+}
+
 fn bits_for(rows: u64, per: u64) -> u32 {
     let per = per.max(1);
     let parts = ((rows / per).max(1)).next_power_of_two().min(2048);
@@ -1836,6 +1846,7 @@ fn main() {
     let mut ltasks: Vec<Task> = Vec::new();
     chunks(&ln_files, Kind::Events, &mut ltasks);
     let t_setup = t0.elapsed();
+    let m_setup = mem_now();
 
     // ---- stage A: parse into id partitions; thread 0 first builds the links
     let links: OnceLock<Links> = OnceLock::new();
@@ -1903,6 +1914,7 @@ fn main() {
     });
     let links = links.into_inner().expect("links");
     let t_a = t0.elapsed();
+    let m_a = mem_now();
 
     // ---- stage B: dedup per id partition, route survivors to person partitions
     let mut qes: Vec<Parts<PRec>> = Vec::with_capacity(nt);
@@ -1972,6 +1984,7 @@ fn main() {
         });
     }
     let t_b = t0.elapsed();
+    let m_b = mem_now();
 
     // ---- stage C: sessionize per person partition, then write user_daily
     let day_min = ws.div_euclid(DAY_MS);
@@ -2035,6 +2048,7 @@ fn main() {
         write_user(&ud_dir.join("part-0.parquet"), &UOut::default(), &cat_names);
     }
     let t_d = t0.elapsed();
+    let m_d = mem_now();
 
     // ---- campaign_daily
     let mut merged: Vec<((u32, u32), CampAgg)> = Vec::new();
@@ -2119,6 +2133,7 @@ fn main() {
         ms(t_setup), ms(t_a - t_setup), ms(t_b - t_a), ms(t_d - t_b), ms(t_e - t_d), ms(t_e),
         total_rows, merged.len()
     );
+    eprintln!("mem (rss/minflt) setup {} parse {} dedup+route {} sessions+write {} end {}", m_setup, m_a, m_b, m_d, mem_now());
     if let Ok(st) = fs::read_to_string("/proc/self/stat") {
         // minor faults, user and system CPU ticks: how much time the kernel took
         let f: Vec<&str> = st.rsplit(')').next().unwrap_or("").split_whitespace().collect();

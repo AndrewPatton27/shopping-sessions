@@ -50,7 +50,7 @@ jobs:
           for i in 1 2 3 4 5; do
             DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/out$i NCPU=$(nproc) \
               /usr/bin/time -v native/target/release/shopping-sessions 2> run$i.err > /dev/null
-            grep "total" run$i.err || true
+            grep -E "total|^mem" run$i.err || true
             grep -E "Elapsed \(wall clock\)|Maximum resident set size" run$i.err
             grep "Elapsed (wall clock)" run$i.err | awk -F': ' '{print $2}' | awk -F: '{ if (NF==3) print $1*3600+$2*60+$3; else print $1*60+$2 }' >> walls.txt
             grep "Maximum resident set size" run$i.err | awk '{print $NF}' >> rss.txt
