@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AO};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
-use ts::{parse_ts, DAY_MS};
+use ts::{parse_ts, Cal, DAY_MS};
 
 const GAP_MS: i64 = 1_800_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
@@ -294,11 +294,8 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
 
 /// Calls `row` with the NF fields (start, end offsets from `base`, quotes
 /// stripped) of every well-formed line starting in [lo, hi). Requires
-/// base[hi] == b'\n' and 128 readable bytes after it.
-///
-/// Lines shorter than 128 bytes (all of them, in practice) take a branch-free
-/// path: one 128-byte mask, NF-1 unrolled comma extractions, and quote
-/// stripping by arithmetic. Longer lines walk 64 bytes at a time.
+/// base[hi] == b'\n' and 128 readable bytes after it (the timestamp parser
+/// reads up to 16 bytes from the start of a field).
 #[inline(always)]
 unsafe fn scan_lines<const NF: usize>(
     base: *const u8,
@@ -309,49 +306,29 @@ unsafe fn scan_lines<const NF: usize>(
     let mut pos = lo;
     while pos < hi {
         let mut ends = [0usize; NF];
-        let start = pos;
+        let mut nf = 0usize;
+        let mut qc = 0u32;
+        let mut off = pos;
         let nl;
-        let nf;
-        let qc;
-        let (c0, n0, q0) = masks64(base.add(pos));
-        let (c1, n1, q1) = masks64(base.add(pos + 64));
-        let n = (n0 as u128) | ((n1 as u128) << 64);
-        if n != 0 {
-            let z = n.trailing_zeros();
-            let below = (1u128 << z) - 1;
-            let mut c = ((c0 as u128) | ((c1 as u128) << 64)) & below;
-            qc = (((q0 as u128) | ((q1 as u128) << 64)) & below).count_ones();
-            nf = c.count_ones() as usize;
-            nl = pos + z as usize;
-            for e in ends.iter_mut().take(NF - 1) {
-                *e = pos + c.trailing_zeros() as usize;
-                c &= c.wrapping_sub(1);
-            }
-        } else {
-            let mut cnt = 0usize;
-            let mut q = 0u32;
-            let mut off = pos;
-            loop {
-                let (cm, nm, qm) = masks64(base.add(off));
-                let below = if nm != 0 { (nm & nm.wrapping_neg()) - 1 } else { !0 };
-                let mut c = cm & below;
-                q += (qm & below).count_ones();
-                while c != 0 {
-                    if cnt < NF - 1 {
-                        ends[cnt] = off + c.trailing_zeros() as usize;
-                    }
-                    cnt += 1;
-                    c &= c - 1;
+        loop {
+            let (cm, nm, qm) = masks64(base.add(off));
+            let below = if nm != 0 { (nm & nm.wrapping_neg()) - 1 } else { !0 };
+            let mut c = cm & below;
+            qc += (qm & below).count_ones();
+            while c != 0 {
+                if nf < NF - 1 {
+                    ends[nf] = off + c.trailing_zeros() as usize;
                 }
-                if nm != 0 {
-                    nl = off + nm.trailing_zeros() as usize;
-                    break;
-                }
-                off += 64;
+                nf += 1;
+                c &= c - 1;
             }
-            nf = cnt;
-            qc = q;
+            if nm != 0 {
+                nl = off + nm.trailing_zeros() as usize;
+                break;
+            }
+            off += 64;
         }
+        let start = pos;
         pos = nl + 1;
         if nf != NF - 1 {
             continue;
@@ -367,9 +344,10 @@ unsafe fn scan_lines<const NF: usize>(
             let mut wrapped = 0u32;
             for x in f.iter_mut() {
                 let (a, b) = *x;
-                let w = ((b >= a + 2) & (*base.add(a) == b'"') & (*base.add(b.max(1) - 1) == b'"')) as usize;
-                *x = (a + w, b - w);
-                wrapped += w as u32;
+                if b - a >= 2 && *base.add(a) == b'"' && *base.add(b - 1) == b'"' {
+                    *x = (a + 1, b - 1);
+                    wrapped += 1;
+                }
             }
             if qc != 2 * wrapped {
                 continue;
@@ -527,6 +505,7 @@ unsafe impl<T> Sync for Ptr<T> {}
 struct Cfg {
     ws: i64,
     we: i64,
+    cal: Cal,
     products: KeyMap,
     unknown_cat: u32,
     campaigns: KeyMap,
@@ -634,7 +613,7 @@ unsafe fn parse_events(cfg: &Cfg, links: &Links, t: u64, base: *const u8, lo: us
             return;
         }
         let eid = eq_key(base.add(a), b - a);
-        let ing = parse_ts(sl(base, f[3])).unwrap_or(i64::MAX);
+        let ing = cfg.cal.parse(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX);
         let rr = r;
         r += 1;
         'v: {
@@ -648,7 +627,7 @@ unsafe fn parse_events(cfg: &Cfg, links: &Links, t: u64, base: *const u8, lo: us
                 b"purchase" => true,
                 _ => break 'v,
             };
-            let ts = match parse_ts(sl(base, f[2])) {
+            let ts = match cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0) {
                 Some(t) if t >= ws && t < we => t,
                 _ => break 'v,
             };
@@ -726,7 +705,7 @@ unsafe fn parse_clicks(cfg: &Cfg, links: &Links, t: u64, base: *const u8, lo: us
                 Some(c) => c,
                 None => break 'v,
             };
-            let ts = match parse_ts(sl(base, f[3])) {
+            let ts = match cfg.cal.parse(base.add(f[3].0), f[3].1 - f[3].0) {
                 Some(t) if t >= cs && t < we => t,
                 _ => break 'v,
             };
@@ -1480,6 +1459,7 @@ fn main() {
     let cfg = Cfg {
         ws,
         we,
+        cal: Cal::new(ws - WEEK_MS, we + WEEK_MS),
         products,
         unknown_cat,
         campaigns,
