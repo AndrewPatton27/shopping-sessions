@@ -1378,6 +1378,25 @@ fn clean_dir(dir: &Path) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn prefetch_files(paths: Vec<PathBuf>) {
+    use std::os::fd::AsRawFd;
+    extern "C" {
+        fn posix_fadvise(fd: i32, off: i64, len: i64, advice: i32) -> i32;
+    }
+    const POSIX_FADV_WILLNEED: i32 = 3;
+    std::thread::spawn(move || {
+        for p in paths {
+            if let Ok(f) = File::open(&p) {
+                unsafe { posix_fadvise(f.as_raw_fd(), 0, 0, POSIX_FADV_WILLNEED) };
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prefetch_files(_paths: Vec<PathBuf>) {}
+
 fn bits_for(rows: u64, per: u64) -> u32 {
     let per = per.max(1);
     let parts = ((rows / per).max(1)).next_power_of_two().min(4096);
@@ -1519,6 +1538,10 @@ fn main() {
     chunks(&ck_files, Kind::Clicks, &mut tasks);
     let mut ltasks: Vec<Task> = Vec::new();
     chunks(&ln_files, Kind::Events, &mut ltasks);
+    // Ask the kernel to start reading every input file now, in the order the
+    // parse threads will want it, so a cold page cache is filled with deep
+    // I/O queues while we compute. Warm caches make this a cheap no-op.
+    prefetch_files(ln_files.iter().chain(&ev_files).chain(&ck_files).map(|f| f.0.clone()).collect());
     let t_setup = t0.elapsed();
 
     // ---- stage A: thread 0 builds the link table while the others parse;
