@@ -1,0 +1,69 @@
+# Benchmark native binary (5 runs) and one scorer-style docker run.
+name: bench
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to benchmark"
+        default: main
+      events:
+        description: "Number of events to generate"
+        default: "10000000"
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      EVENTS: ${{ inputs.events }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install Rust stable
+        run: rustup default stable
+      - name: Build generator and generate data
+        run: |
+          curl -sSfL -o gen.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+          unzip -q gen.zip -d gen
+          cargo build --release --manifest-path gen/generator/Cargo.toml
+          gen/generator/target/release/generate --seed 11 --events "$EVENTS" --clicks $(( EVENTS / 4 )) --output /tmp/data
+      - name: Build native binary
+        run: |
+          if grep -q avx2 /proc/cpuinfo; then
+            cd native && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+          else
+            echo "::notice::CPU lacks AVX2, using plain build"
+            cd native && cargo build --release
+          fi
+      - name: Warm page cache
+        run: cat /tmp/data/*/*.csv /tmp/data/*.csv > /dev/null
+      - name: Native runs (x5)
+        run: |
+          : > walls.txt; : > rss.txt
+          for i in 1 2 3 4 5; do
+            DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/out$i NCPU=$(nproc) \
+              /usr/bin/time -v native/target/release/shopping-sessions 2> run$i.err > /dev/null
+            grep "total" run$i.err || true
+            grep -E "Elapsed \(wall clock\)|Maximum resident set size" run$i.err
+            grep "Elapsed (wall clock)" run$i.err | awk -F': ' '{print $2}' | awk -F: '{ if (NF==3) print $1*3600+$2*60+$3; else print $1*60+$2 }' >> walls.txt
+            grep "Maximum resident set size" run$i.err | awk '{print $NF}' >> rss.txt
+          done
+      - name: Docker run (x1)
+        run: |
+          docker build -t ss .
+          start=$(date +%s%N)
+          IMAGE=ss CPUS=$(nproc) MEM=6g scripts/docker_run.sh /tmp/data /tmp/outd
+          end=$(date +%s%N)
+          echo $(( (end - start) / 1000000 )) > docker_ms.txt
+      - name: Summary
+        run: |
+          median=$(sort -n walls.txt | sed -n 3p)
+          peak=$(sort -n rss.txt | tail -1)
+          docker_ms=$(cat docker_ms.txt)
+          {
+            echo "| Metric | Value |"
+            echo "| --- | --- |"
+            echo "| Native median wall (s, 5 runs) | ${median} |"
+            echo "| Native peak RSS (kB) | ${peak} |"
+            echo "| Docker run wall (ms) | ${docker_ms} |"
+          } >> "$GITHUB_STEP_SUMMARY"

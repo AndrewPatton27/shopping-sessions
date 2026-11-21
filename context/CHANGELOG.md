@@ -33,3 +33,6 @@
 - 2026-11-21: fuzz.py + FUZZ=1 committed. Native PASS 50 seeds; Polars fallback FAILS seed 17 (click person mapping) -> Sonnet round 3.
 - 2026-11-21: Polars fallback: click dedup keep=first (file order) like reference; fuzz 1-200 PASS. Native wide fuzz seeds 51-400 run.
 - 2026-11-21: GitHub Actions CI added: both images build on linux/amd64, 36/36 fixtures pass in-container (scorer flags). Found regress CSVs missing from git; fixed.
+- 2026-11-21: Rust parse speed round: no change beat noise; reverted. Remaining lever: DRec 32->24 B (invasive). Local timing plateau.
+- 2026-11-21: User approved: stripped Co-Authored-By from history (filter-branch, backup branch backup-before-attribution-strip, tree identical), force-pushed, repo PUBLIC, attribution off (.claude/settings.json). Submitted BB-4E5D972D @ 12f18b6 (Rust).
+- 2026-11-21: BB-4E5D972D scored 1.59 s, correct, rank 147/250 (top 0.31 s, 10th 0.64 s). Local 20M estimate ~0.85 s -> Linux/scorer gap to investigate.
