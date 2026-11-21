@@ -855,20 +855,12 @@ unsafe fn parse_clicks(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u
 
 /// user ID -> person name (the byte-wise smallest ID of its component), for
 /// the IDs that are not their own person's name; any other ID maps to itself.
-/// Buckets of 8 keys (one cache line) and their 8 values (the next line),
-/// half full on average; a probe compares all eight keys without branching
-/// on the outcome (whether an ID is linked is unpredictable), and moves to
-/// the next bucket only when one is full and holds no match (about 2% of
-/// misses; 4-key buckets overflowed for about 14%).
+/// Buckets of 4 keys and their values, one cache line each, at most half
+/// full; a probe compares all four keys without branching on the outcome
+/// (whether an ID is linked is unpredictable), and moves to the next bucket
+/// only when one is full and holds no match.
 struct Links {
-    bk: Vec<Bucket8>,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C, align(128))]
-struct Bucket8 {
-    k: [u64; 8],
-    v: [u64; 8],
+    bk: Vec<Bucket>,
 }
 
 #[derive(Clone, Copy)]
@@ -886,9 +878,7 @@ impl Links {
     #[inline(always)]
     fn prefetch(&self, h: u64) {
         if !self.bk.is_empty() {
-            let b = unsafe { self.bk.as_ptr().add(self.home(h)) };
-            prefetch(b);
-            prefetch(unsafe { (b as *const u8).add(64) });
+            prefetch(unsafe { self.bk.as_ptr().add(self.home(h)) });
         }
     }
     #[inline(always)]
@@ -901,12 +891,12 @@ impl Links {
             let bk = unsafe { self.bk.get_unchecked(b) };
             let mut m = 0u32;
             let mut z = 0u32;
-            for i in 0..8 {
+            for i in 0..4 {
                 m |= ((bk.k[i] == k) as u32) << i;
                 z |= ((bk.k[i] == 0) as u32) << i;
             }
             if (m | z) != 0 {
-                let v = bk.v[(m.trailing_zeros() & 7) as usize];
+                let v = bk.v[(m.trailing_zeros() & 3) as usize];
                 return if m != 0 { v } else { k };
             }
             b += 1;
@@ -1004,12 +994,12 @@ fn build_links(pairs: &[(u64, u64)]) -> Links {
             moved.push((keys[i as usize], keys[r as usize]));
         }
     }
-    let nbk = (moved.len() / 4).max(4);
-    let mut out = Links { bk: vec![Bucket8 { k: [0; 8], v: [0; 8] }; nbk] };
+    let nbk = (moved.len() / 2).max(4);
+    let mut out = Links { bk: vec![Bucket { k: [0; 4], v: [0; 4] }; nbk] };
     for &(k, v) in &moved {
         let mut b = out.home(mix(k));
         'ins: loop {
-            for i in 0..8 {
+            for i in 0..4 {
                 if out.bk[b].k[i] == 0 {
                     out.bk[b].k[i] = k;
                     out.bk[b].v[i] = v;
