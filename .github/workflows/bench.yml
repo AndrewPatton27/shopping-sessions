@@ -96,10 +96,9 @@ jobs:
           (cd /tmp/base/native && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q)
           NEW=$PWD/native/target/release/shopping-sessions
           OLD=/tmp/base/native/target/release/shopping-sessions
-          printf '#include <stdlib.h>
-#include <string.h>
-int main(){size_t n=256u<<20;char*a=malloc(n),*b=malloc(n);memset(a,1,n);memset(b,2,n);for(;;){memcpy(b,a,n);memcpy(a,b,n);}}
-' > /tmp/hog.c
+          echo '#include <stdlib.h>' > /tmp/hog.c
+          echo '#include <string.h>' >> /tmp/hog.c
+          echo 'int main(){size_t n=256u<<20;char*a=malloc(n),*b=malloc(n);memset(a,1,n);memset(b,2,n);for(;;){memcpy(b,a,n);memcpy(a,b,n);}}' >> /tmp/hog.c
           gcc -O2 -o /tmp/hog /tmp/hog.c
           lscpu | grep -E "Model name|Thread|Core|Socket|L3"
           one() { # label bin cpus ncpu out
