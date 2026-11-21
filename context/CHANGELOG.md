@@ -32,3 +32,4 @@
 - 2026-11-21: Rust safety: read_range zero-fill (no set_len UB), bits_for div0 guard. Interleaved 10M timing old vs new: no measurable change. Committed.
 - 2026-11-21: fuzz.py + FUZZ=1 committed. Native PASS 50 seeds; Polars fallback FAILS seed 17 (click person mapping) -> Sonnet round 3.
 - 2026-11-21: Polars fallback: click dedup keep=first (file order) like reference; fuzz 1-200 PASS. Native wide fuzz seeds 51-400 run.
+- 2026-11-21: GitHub Actions CI added: both images build on linux/amd64, 36/36 fixtures pass in-container (scorer flags). Found regress CSVs missing from git; fixed.

@@ -5,6 +5,7 @@ stress/
 *.parquet
 *.csv
 !fixtures/**/*.csv
+!regress/**/*.csv
 __pycache__/
 *.pyc
 native/target/
