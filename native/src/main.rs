@@ -113,6 +113,55 @@ unsafe fn pack7(p: *const u8, len: usize) -> Option<u64> {
     Some((x << 7) | b8)
 }
 
+/// pack7 of 8 IDs at once: ID i is the n[i] bytes at base + a[i]. Lanes
+/// pack7 rejects are set in the returned mask (their out value is garbage).
+/// Requires 16 readable bytes at each ID start.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn pack8(base: *const u8, a: &[u32; 8], n: &[u32; 8], out: &mut [u64; 8]) -> u8 {
+    use std::arch::x86_64::*;
+    let av = _mm256_loadu_si256(a.as_ptr() as *const _);
+    let nv = _mm256_loadu_si256(n.as_ptr() as *const _);
+    let s1 = |v: i32| _mm256_set1_epi32(v);
+    let zero = _mm256_setzero_si256();
+    // 1..=9 bytes: n - 1 <= 8 unsigned
+    let nm1 = _mm256_sub_epi32(nv, s1(1));
+    let len_ok = _mm256_cmpeq_epi32(_mm256_min_epu32(nm1, s1(8)), nm1);
+    // byte 8 of each ID, 0 unless it has 9 bytes
+    let n9 = _mm256_cmpeq_epi32(nv, s1(9));
+    let b8w = _mm256_and_si256(_mm256_i32gather_epi32::<1>(base as *const i32, _mm256_add_epi32(av, s1(8))), _mm256_and_si256(n9, s1(0xFF)));
+    let slow = _mm256_or_si256(_mm256_andnot_si256(len_ok, s1(-1)), _mm256_and_si256(n9, _mm256_cmpeq_epi32(b8w, zero)));
+    let mut bad = _mm256_movemask_ps(_mm256_castsi256_ps(slow)) as u8;
+    let bswap = _mm256_set_epi64x(0x08090A0B0C0D0E0F, 0x0001020304050607, 0x08090A0B0C0D0E0F, 0x0001020304050607);
+    let s64 = |v: u64| _mm256_set1_epi64x(v as i64);
+    let len8 = _mm256_min_epu32(nv, s1(8));
+    for half in 0..2 {
+        let (ai, li, bi) = if half == 0 {
+            (_mm256_castsi256_si128(av), _mm256_castsi256_si128(len8), _mm256_castsi256_si128(b8w))
+        } else {
+            (_mm256_extracti128_si256::<1>(av), _mm256_extracti128_si256::<1>(len8), _mm256_extracti128_si256::<1>(b8w))
+        };
+        let raw = _mm256_i32gather_epi64::<1>(base as *const i64, ai);
+        let v = _mm256_shuffle_epi8(raw, bswap);
+        let len = _mm256_cvtepu32_epi64(li);
+        let b8 = _mm256_cvtepu32_epi64(bi);
+        // m = !0 << (64 - 8 * len) (0 for len 0)
+        let m = _mm256_sllv_epi64(s64(!0), _mm256_sub_epi64(s64(64), _mm256_slli_epi64::<3>(len)));
+        let v = _mm256_and_si256(v, m);
+        let t = _mm256_or_si256(v, _mm256_andnot_si256(m, s64(0x0101_0101_0101_0101)));
+        let zb = _mm256_andnot_si256(t, _mm256_sub_epi64(t, s64(0x0101_0101_0101_0101)));
+        let hib = _mm256_and_si256(_mm256_or_si256(_mm256_or_si256(v, b8), zb), s64(0x8080_8080_8080_8080));
+        let ok = _mm256_cmpeq_epi64(hib, zero);
+        bad |= ((!_mm256_movemask_pd(_mm256_castsi256_pd(ok)) & 0xF) as u8) << (4 * half);
+        let x = _mm256_or_si256(_mm256_srli_epi64::<1>(_mm256_and_si256(v, s64(0x7F00_7F00_7F00_7F00))), _mm256_and_si256(v, s64(0x007F_007F_007F_007F)));
+        let x = _mm256_or_si256(_mm256_srli_epi64::<2>(_mm256_and_si256(x, s64(0x3FFF_0000_3FFF_0000))), _mm256_and_si256(x, s64(0x0000_3FFF_0000_3FFF)));
+        let x = _mm256_or_si256(_mm256_srli_epi64::<4>(_mm256_and_si256(x, s64(0x0FFF_FFFF_0000_0000))), _mm256_and_si256(x, s64(0x0000_0000_0FFF_FFFF)));
+        let k = _mm256_or_si256(_mm256_slli_epi64::<7>(x), b8);
+        _mm256_storeu_si256(out.as_mut_ptr().add(4 * half) as *mut _, k);
+    }
+    bad
+}
+
 /// Exact key of a non-empty ID (interns other IDs).
 #[inline(always)]
 unsafe fn key_of(p: *const u8, len: usize) -> u64 {
@@ -324,19 +373,37 @@ unsafe fn scan<const NF: usize>(base: *const u8, lo: usize, hi: usize, mut row: 
         // field starts (after each separator) and ends (at each separator),
         // moved inward past a field's quotes: then field i is the i-th set
         // bit of each mask, with no per-field shifts or quote tests
-        let mut st = (((c << 1) | 1) & !qs) | (qs << 1);
-        let mut en = (sp & !(qe << 1)) | qe;
+        let st = (((c << 1) | 1) & !qs) | (qs << 1);
+        let en = (sp & !(qe << 1)) | qe;
+        let (sb, eb) = (flat::<NF>(st), flat::<NF>(en));
         let mut f = [(0usize, 0usize); NF];
-        for x in f.iter_mut() {
-            let a = st.trailing_zeros();
-            st &= st - 1;
-            let e = en.trailing_zeros();
-            en &= en - 1;
-            *x = (pos + a as usize, pos + e as usize);
+        for (k, x) in f.iter_mut().enumerate() {
+            *x = (pos + sb[k] as usize, pos + eb[k] as usize);
         }
         row(&f);
         pos = next;
     }
+}
+
+/// Offsets of the first NF set bits of m (which has at most NF), in order.
+/// Each 64-bit half runs its own fixed-length tzcnt chain (no u128 carries,
+/// no branch on the bit count); the high half's offsets are written after the
+/// low half's count, over the low chain's spare entries.
+#[inline(always)]
+fn flat<const NF: usize>(m: u128) -> [u8; 16] {
+    const { assert!(2 * NF <= 16) };
+    let mut o = [0u8; 16];
+    let (mut lo, mut hi) = (m as u64, (m >> 64) as u64);
+    let c = lo.count_ones() as usize;
+    for x in o.iter_mut().take(NF) {
+        *x = lo.trailing_zeros() as u8;
+        lo &= lo.wrapping_sub(1);
+    }
+    for i in 0..NF {
+        o[(c + i) & 15] = 64 + hi.trailing_zeros() as u8;
+        hi &= hi.wrapping_sub(1);
+    }
+    o
 }
 
 /// One line of 128 bytes or more, scalar. Returns the next line's start.
@@ -752,53 +819,184 @@ unsafe fn rd32(p: *const u8) -> u32 {
     std::ptr::read_unaligned(p as *const u32)
 }
 
-unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
-    let (ws, we) = (cfg.ws, cfg.we);
+/// AVX2 build: event rows take the 8-lane batch.
+const LANES8: bool = cfg!(all(target_arch = "x86_64", target_feature = "avx2"));
 
+unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
+    if LANES8 {
+        // rows collect 8 at a time; their ts, ingest_ts, event_id and user_id
+        // columns are parsed 8 lanes at once, then each row is finished alone
+        let mut bt = Batch8 { f: [[(0, 0); 7]; 8], ta: [0; 8], tn: [0; 8], ia: [0; 8], inn: [0; 8], ea: [0; 8], en: [0; 8], ua: [0; 8], un: [0; 8], cnt: 0 };
+        scan::<7>(base, lo, hi, |f| {
+            if f[0].0 == f[0].1 {
+                return;
+            }
+            let i = bt.cnt;
+            *bt.f.get_unchecked_mut(i) = *f;
+            *bt.ta.get_unchecked_mut(i) = f[2].0 as u32;
+            *bt.tn.get_unchecked_mut(i) = (f[2].1 - f[2].0) as u32;
+            *bt.ia.get_unchecked_mut(i) = f[3].0 as u32;
+            *bt.inn.get_unchecked_mut(i) = (f[3].1 - f[3].0) as u32;
+            *bt.ea.get_unchecked_mut(i) = f[0].0 as u32;
+            *bt.en.get_unchecked_mut(i) = (f[0].1 - f[0].0) as u32;
+            *bt.ua.get_unchecked_mut(i) = f[1].0 as u32;
+            *bt.un.get_unchecked_mut(i) = (f[1].1 - f[1].0) as u32;
+            bt.cnt = i + 1;
+            if i == 7 {
+                bt.run(cfg, base, out);
+            }
+        });
+        if bt.cnt > 0 {
+            bt.run(cfg, base, out);
+        }
+        return;
+    }
+    scan::<7>(base, lo, hi, |f| {
+        if f[0].0 == f[0].1 {
+            return;
+        }
+        let ing = cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX);
+        event_row(
+            cfg,
+            base,
+            f,
+            key_of(base.add(f[0].0), f[0].1 - f[0].0),
+            ing,
+            || cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0),
+            || key_of(base.add(f[1].0), f[1].1 - f[1].0),
+            out,
+        );
+    });
+}
+
+/// Up to 8 event rows (non-empty event_id) waiting for the 8-lane parse:
+/// their fields, and the starts and lengths of ts, ingest_ts, event_id and
+/// user_id.
+struct Batch8 {
+    f: [[(usize, usize); 7]; 8],
+    ta: [u32; 8],
+    tn: [u32; 8],
+    ia: [u32; 8],
+    inn: [u32; 8],
+    ea: [u32; 8],
+    en: [u32; 8],
+    ua: [u32; 8],
+    un: [u32; 8],
+    cnt: usize,
+}
+
+impl Batch8 {
+    #[inline(always)]
+    unsafe fn run(&mut self, cfg: &Cfg, base: *const u8, out: &mut Parts<ERec>) {
+        let n = self.cnt;
+        self.cnt = 0;
+        // unused lanes repeat lane 0 (readable bytes; results ignored)
+        for i in n..8 {
+            self.ta[i] = self.ta[0];
+            self.tn[i] = self.tn[0];
+            self.ia[i] = self.ia[0];
+            self.inn[i] = self.inn[0];
+            self.ea[i] = self.ea[0];
+            self.en[i] = self.en[0];
+            self.ua[i] = self.ua[0];
+            self.un[i] = self.un[0];
+        }
+        let mut tv = [0i64; 8];
+        let mut iv = [0i64; 8];
+        let mut ev = [0u64; 8];
+        let mut uv = [0u64; 8];
+        let (ts_slow, ing_slow, e_slow, u_slow) = {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                (
+                    cfg.cal.parse8(base, &self.ta, &self.tn, false, &mut tv),
+                    cfg.cal.parse8(base, &self.ia, &self.inn, true, &mut iv),
+                    pack8(base, &self.ea, &self.en, &mut ev),
+                    pack8(base, &self.ua, &self.un, &mut uv),
+                )
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            {
+                (u8::MAX, u8::MAX, u8::MAX, u8::MAX)
+            }
+        };
+        for i in 0..n {
+            let f = &self.f[i];
+            let ing = if (ing_slow >> i) & 1 != 0 {
+                cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX)
+            } else {
+                iv[i]
+            };
+            let slow = (ts_slow >> i) & 1 != 0;
+            let t = tv[i];
+            let eid = if (e_slow >> i) & 1 != 0 { key_of(base.add(f[0].0), f[0].1 - f[0].0) } else { ev[i] };
+            let (us, u) = ((u_slow >> i) & 1 != 0, uv[i]);
+            event_row(
+                cfg,
+                base,
+                f,
+                eid,
+                ing,
+                || if slow { cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0) } else if t == i64::MIN { None } else { Some(t) },
+                || if us { key_of(base.add(f[1].0), f[1].1 - f[1].0) } else { u },
+                out,
+            );
+        }
+    }
+}
+
+/// One event row with a non-empty event_id, given its key and ingest time,
+/// its ts parser (called only once the cheaper checks pass) and its user key
+/// (called only for a valid row).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn event_row(
+    cfg: &Cfg,
+    base: *const u8,
+    f: &[(usize, usize); 7],
+    eid: u64,
+    ing: i64,
+    ts: impl FnOnce() -> Option<i64>,
+    user: impl FnOnce() -> u64,
+    out: &mut Parts<ERec>,
+) {
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
-    scan::<7>(base, lo, hi, |f| {
-        let (a, b) = f[0];
-        if a == b {
-            return;
+    let (ws, we) = (cfg.ws, cfg.we);
+    let mut r = ERec { eid, user: 0, ing, ts: DEAD, pc: 0 };
+    'v: {
+        let (ua, ub) = f[1];
+        let (pa, pb) = f[5];
+        let (ta, tb) = f[4];
+        if ua == ub || pa == pb {
+            break 'v;
         }
-        let eid = key_of(base.add(a), b - a);
-        let ing = cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX);
-        let mut r = ERec { eid, user: 0, ing, ts: DEAD, pc: 0 };
-        'v: {
-            let (ua, ub) = f[1];
-            let (pa, pb) = f[5];
-            let (ta, tb) = f[4];
-            if ua == ub || pa == pb {
-                break 'v;
-            }
-            let tl = tb - ta;
-            let purchase = tl == 8 && std::ptr::read_unaligned(base.add(ta) as *const u64) == PURCHASE;
-            let w = rd32(base.add(ta));
-            if !purchase & !((tl == 4) & ((w == VIEW) | (w == CART))) {
-                break 'v;
-            }
-            let ts = match cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0) {
-                Some(t) if t >= ws && t < we => t,
-                _ => break 'v,
+        let tl = tb - ta;
+        let purchase = tl == 8 && std::ptr::read_unaligned(base.add(ta) as *const u64) == PURCHASE;
+        let w = rd32(base.add(ta));
+        if !purchase & !((tl == 4) & ((w == VIEW) | (w == CART))) {
+            break 'v;
+        }
+        let ts = match ts() {
+            Some(t) if t >= ws && t < we => t,
+            _ => break 'v,
+        };
+        if ing.saturating_sub(ts) > DAY_MS {
+            break 'v;
+        }
+        if purchase {
+            let price = match parse_price(std::slice::from_raw_parts(base.add(f[6].0), f[6].1 - f[6].0)) {
+                Some(p) => p,
+                None => break 'v,
             };
-            if ing.saturating_sub(ts) > DAY_MS {
-                break 'v;
-            }
-            if purchase {
-                let price = match parse_price(std::slice::from_raw_parts(base.add(f[6].0), f[6].1 - f[6].0)) {
-                    Some(p) => p,
-                    None => break 'v,
-                };
-                let cat = key_find(base.add(pa), pb - pa).and_then(|k| cfg.products.get(k)).unwrap_or(cfg.unknown_cat);
-                r.pc = (price << 8) | cat;
-            }
-            r.user = key_of(base.add(ua), ub - ua);
-            r.ts = (ts - ws) as u32;
+            let cat = key_find(base.add(pa), pb - pa).and_then(|k| cfg.products.get(k)).unwrap_or(cfg.unknown_cat);
+            r.pc = (price << 8) | cat;
         }
-        out.push(part_of(mix(eid), cfg.pe_bits), r);
-    });
+        r.user = user();
+        r.ts = (ts - ws) as u32;
+    }
+    out.push(part_of(mix(eid), cfg.pe_bits), r);
 }
 
 /// Invalid clicks are kept (camp DEAD): dedup comes before validation.
@@ -1684,6 +1882,24 @@ fn user_writer(path: &Path) -> pq::Writer {
 
 // ------------------------------------------------------------------ main
 
+/// The SIMD features this CPU reports, for the timing line (" avx2 bmi2 ...").
+fn cpu_flags() -> String {
+    let mut s = String::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        macro_rules! f {
+            ($($n:tt),*) => {
+                $(if is_x86_feature_detected!($n) {
+                    s.push(' ');
+                    s.push_str($n);
+                })*
+            };
+        }
+        f!("avx2", "bmi2", "avx512f", "avx512bw", "avx512dq", "avx512vl", "avx512vbmi", "avx512vbmi2", "avx512ifma", "gfni", "vpclmulqdq");
+    }
+    s
+}
+
 fn manifest_ts(txt: &str, key: &str) -> i64 {
     let pat = format!("\"{}\"", key);
     let i = txt.find(&pat).unwrap_or_else(|| panic!("manifest: no {}", key));
@@ -2146,10 +2362,10 @@ fn main() {
     let t_e = t0.elapsed();
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
-        "threads {} parts {}/{}/{} | setup {:.0} parse {:.0} dedup+route {:.0} sessions+write {:.0} campaigns {:.0} | total {:.0} ms | user rows {} campaign rows {}",
+        "threads {} parts {}/{}/{} | setup {:.0} parse {:.0} dedup+route {:.0} sessions+write {:.0} campaigns {:.0} | total {:.0} ms | user rows {} campaign rows {} | cpu{}",
         nt, npe, npc, nq,
         ms(t_setup), ms(t_a - t_setup), ms(t_b - t_a), ms(t_d - t_b), ms(t_e - t_d), ms(t_e),
-        total_rows, merged.len()
+        total_rows, merged.len(), cpu_flags()
     );
     eprintln!("mem (rss/peak/minflt) setup {} parse {} dedup+route {} sessions+write {} end {}", m_setup, m_a, m_b, m_d, mem_now());
     if let Ok(st) = fs::read_to_string("/proc/self/stat") {

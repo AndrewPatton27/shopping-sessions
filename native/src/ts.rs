@@ -163,6 +163,8 @@ pub struct Cal {
     /// Epoch day of the 1st of each month from January of y0.
     first: Vec<i64>,
     dim: Vec<u8>,
+    /// first << 5 | dim, for parse8's gather.
+    fd: Vec<i32>,
 }
 
 impl Cal {
@@ -189,7 +191,8 @@ impl Cal {
                 dim.push(if m == 2 && leap { 29 } else { MDAYS[(m - 1) as usize] as u8 });
             }
         }
-        Cal { y0, first, dim }
+        let fd = first.iter().zip(&dim).map(|(&f, &d)| ((f as i32) << 5) | d as i32).collect();
+        Cal { y0, first, dim, fd }
     }
 
     /// parse_ts of the n bytes at p. Requires 16 readable bytes at p.
@@ -215,6 +218,163 @@ impl Cal {
             return None;
         }
         Some((parse8(lo) * 100_000_000 + parse8(hi)) as i64)
+    }
+
+    /// parse (or, `trusted`, f1_trusted) of 8 fields at once: field i is the
+    /// n[i] bytes at base + a[i]. A lane's result is its epoch ms, i64::MIN
+    /// for None. Lanes the vector code does not settle (long digit runs,
+    /// dates outside the table, trusted values of another shape) are left to
+    /// the caller: their bits are set in the returned mask. Requires 32
+    /// readable bytes after each field start and 3 before it.
+    ///
+    /// Lane-parallel over the rows: F1/F2 bytes come from gathers at fixed
+    /// offsets, F3 digits from gathers ending at the field end; both forms are
+    /// computed for every lane and selected with masks, so no branch depends on
+    /// a row's form.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline(always)]
+    pub unsafe fn parse8(&self, base: *const u8, a: &[u32; 8], n: &[u32; 8], trusted: bool, out: &mut [i64; 8]) -> u8 {
+        use std::arch::x86_64::*;
+        let av = _mm256_loadu_si256(a.as_ptr() as *const _);
+        let nv = _mm256_loadu_si256(n.as_ptr() as *const _);
+        let s1 = |v: i32| _mm256_set1_epi32(v);
+        let zero = _mm256_setzero_si256();
+        let ones = s1(-1);
+        let z = _mm256_set1_epi8(b'0' as i8);
+        let ten = _mm256_set1_epi16(0x010A);
+        let hund = s1(100 | (1 << 16));
+        let lo16 = s1(0xFFFF);
+        let gp = base as *const i32;
+        let and = |x: __m256i, y: __m256i| _mm256_and_si256(x, y);
+        let or = |x: __m256i, y: __m256i| _mm256_or_si256(x, y);
+        let not = |x: __m256i| _mm256_andnot_si256(x, ones);
+        // lanes where x < b (unsigned; b >= 1)
+        let ltu = |x: __m256i, b: i32| _mm256_cmpeq_epi32(_mm256_min_epu32(x, s1(b - 1)), x);
+        macro_rules! g {
+            ($m:expr, $off:expr) => {
+                _mm256_mask_i32gather_epi32::<1>(z, gp, _mm256_add_epi32(av, s1($off)), $m)
+            };
+        }
+        // lanes whose bytes under m (high bit per byte) are all digits
+        macro_rules! dg {
+            ($t:expr, $m:expr) => {
+                _mm256_cmpeq_epi32(and(_mm256_adds_epu8($t, _mm256_set1_epi8(0x76)), s1($m as i32)), zero)
+            };
+        }
+        macro_rules! eq {
+            ($x:expr, $m:expr, $v:expr) => {
+                _mm256_cmpeq_epi32(and($x, s1($m as i32)), s1($v as i32))
+            };
+        }
+        // a 2-digit pair's value from the low two bytes of t
+        macro_rules! p2 {
+            ($t:expr) => {
+                and(_mm256_maddubs_epi16($t, ten), lo16)
+            };
+        }
+        // ---- F1 / F2: "YYYY-MM-DDTHH:MM:SS" + "Z" or "+HH:MM"
+        let xa = _mm256_i32gather_epi32::<1>(gp, av);
+        let xb = _mm256_i32gather_epi32::<1>(gp, _mm256_add_epi32(av, s1(4)));
+        let xc = _mm256_i32gather_epi32::<1>(gp, _mm256_add_epi32(av, s1(8)));
+        let xd = _mm256_i32gather_epi32::<1>(gp, _mm256_add_epi32(av, s1(12)));
+        let xe = _mm256_i32gather_epi32::<1>(gp, _mm256_add_epi32(av, s1(16)));
+        let (ta, tb, tc, td, te) =
+            (_mm256_sub_epi8(xa, z), _mm256_sub_epi8(xb, z), _mm256_sub_epi8(xc, z), _mm256_sub_epi8(xd, z), _mm256_sub_epi8(xe, z));
+        let digs = and(and(and(dg!(ta, 0x8080_8080u32), dg!(tb, 0x0080_8000u32)), and(dg!(tc, 0x8000_8080u32), dg!(td, 0x8080_0080u32))), dg!(te, 0x0080_8000u32));
+        let seps = and(
+            and(eq!(xb, 0xFF00_00FFu32, (b'-' as u32) | (b'-' as u32) << 24), eq!(xc, 0x00FF_0000u32, (b'T' as u32) << 16)),
+            and(eq!(xd, 0x0000_FF00u32, (b':' as u32) << 8), eq!(xe, 0x0000_00FFu32, b':' as u32)),
+        );
+        let shape = and(seps, digs);
+        let c19 = _mm256_srli_epi32::<24>(xe);
+        let n20 = _mm256_cmpeq_epi32(nv, s1(20));
+        let n25 = _mm256_cmpeq_epi32(nv, s1(25));
+        let is_z = and(n20, _mm256_cmpeq_epi32(c19, s1(b'Z' as i32)));
+        let plus = _mm256_cmpeq_epi32(c19, s1(b'+' as i32));
+        let is_pm = and(n25, or(plus, _mm256_cmpeq_epi32(c19, s1(b'-' as i32))));
+        let y = _mm256_madd_epi16(_mm256_maddubs_epi16(ta, ten), hund);
+        let mo = p2!(_mm256_srli_epi32::<8>(tb));
+        let d = p2!(tc);
+        let h = p2!(or(_mm256_srli_epi32::<24>(tc), _mm256_slli_epi32::<8>(td)));
+        let mi = p2!(_mm256_srli_epi32::<16>(td));
+        let se = p2!(_mm256_srli_epi32::<8>(te));
+        let k = _mm256_add_epi32(_mm256_mullo_epi32(_mm256_sub_epi32(y, s1(self.y0 as i32)), s1(12)), _mm256_sub_epi32(mo, s1(1)));
+        let kin = ltu(k, self.fd.len() as i32);
+        let tab = _mm256_mask_i32gather_epi32::<4>(zero, self.fd.as_ptr(), k, kin);
+        let first = _mm256_srai_epi32::<5>(tab);
+        let dim = and(tab, s1(31));
+        let mut secs = _mm256_add_epi32(_mm256_mullo_epi32(_mm256_add_epi32(_mm256_mullo_epi32(h, s1(60)), mi), s1(60)), se);
+        let day = _mm256_add_epi32(first, _mm256_sub_epi32(d, s1(1)));
+        let iso_ok;
+        let slow;
+        if trusted {
+            iso_ok = and(and(n20, shape), kin);
+            slow = not(iso_ok);
+        } else {
+            let rng = and(
+                and(ltu(_mm256_sub_epi32(mo, s1(1)), 12), ltu(h, 24)),
+                and(and(ltu(mi, 60), ltu(se, 60)), ltu(_mm256_sub_epi32(d, s1(1)), 31)),
+            );
+            let mut ok = and(and(or(is_z, is_pm), shape), rng);
+            // F2 offset "+HH:MM": bytes 20..24 and 21..25
+            let xf = g!(is_pm, 20);
+            let xg = g!(is_pm, 21);
+            let (tf, tg) = (_mm256_sub_epi8(xf, z), _mm256_sub_epi8(xg, z));
+            let oh = p2!(tf);
+            let om = p2!(_mm256_srli_epi32::<16>(tg));
+            let off_ok = and(
+                and(and(dg!(tf, 0x8000_8080u32), dg!(tg, 0x8000_0000u32)), eq!(xf, 0x00FF_0000u32, (b':' as u32) << 16)),
+                and(ltu(oh, 24), ltu(om, 60)),
+            );
+            ok = and(ok, or(is_z, off_ok));
+            let off = _mm256_mullo_epi32(_mm256_add_epi32(_mm256_mullo_epi32(oh, s1(60)), om), s1(60));
+            // '+' subtracts the offset, '-' adds it
+            secs = _mm256_sub_epi32(secs, and(off, and(is_pm, plus)));
+            secs = _mm256_add_epi32(secs, and(off, _mm256_andnot_si256(plus, is_pm)));
+            let dok = _mm256_cmpeq_epi32(_mm256_min_epu32(d, dim), d);
+            let long = not(ltu(nv, 17));
+            slow = or(_mm256_andnot_si256(kin, ok), _mm256_andnot_si256(or(is_z, is_pm), long));
+            iso_ok = and(and(ok, kin), dok);
+        }
+        // ---- F3: up to 16 digits, read as four 4-byte groups ending at the
+        // field end; bytes before the field start count as '0'
+        let mut q = [zero; 4];
+        let mut dok = zero;
+        if !trusted {
+            let dig = ltu(_mm256_sub_epi32(nv, s1(1)), 16);
+            let mut dgood = dig;
+            for (j, qj) in q.iter_mut().enumerate() {
+                let j4 = 4 * j as i32;
+                let m = and(dig, _mm256_cmpgt_epi32(nv, s1(j4)));
+                let x = _mm256_mask_i32gather_epi32::<1>(z, gp, _mm256_add_epi32(av, _mm256_sub_epi32(nv, s1(j4 + 4))), m);
+                let sh = _mm256_slli_epi32::<3>(_mm256_max_epi32(_mm256_sub_epi32(s1(j4 + 4), nv), zero));
+                let keep = _mm256_sllv_epi32(ones, sh);
+                // keep ? x : '0'
+                let x = or(and(keep, x), _mm256_andnot_si256(keep, z));
+                let t = _mm256_sub_epi8(x, z);
+                dgood = and(dgood, dg!(t, 0x8080_8080u32));
+                *qj = _mm256_madd_epi16(_mm256_maddubs_epi16(t, ten), hund);
+            }
+            dok = dgood;
+        }
+        let hi8 = _mm256_add_epi32(_mm256_mullo_epi32(q[3], s1(10_000)), q[2]);
+        let lo8 = _mm256_add_epi32(_mm256_mullo_epi32(q[1], s1(10_000)), q[0]);
+        // ---- to i64, 4 lanes per half
+        let none = _mm256_set1_epi64x(i64::MIN);
+        let lo = |v: __m256i| _mm256_castsi256_si128(v);
+        let hi = |v: __m256i| _mm256_extracti128_si256::<1>(v);
+        for half in 0..2 {
+            let pick = |v: __m256i| if half == 0 { lo(v) } else { hi(v) };
+            let ms = _mm256_add_epi64(
+                _mm256_mul_epi32(_mm256_cvtepi32_epi64(pick(day)), _mm256_set1_epi64x(DAY_MS)),
+                _mm256_mul_epi32(_mm256_cvtepi32_epi64(pick(secs)), _mm256_set1_epi64x(1000)),
+            );
+            let num = _mm256_add_epi64(_mm256_mul_epu32(_mm256_cvtepu32_epi64(pick(hi8)), _mm256_set1_epi64x(100_000_000)), _mm256_cvtepu32_epi64(pick(lo8)));
+            let r = _mm256_blendv_epi8(none, num, _mm256_cvtepi32_epi64(pick(dok)));
+            let r = _mm256_blendv_epi8(r, ms, _mm256_cvtepi32_epi64(pick(iso_ok)));
+            _mm256_storeu_si256(out.as_mut_ptr().add(4 * half) as *mut _, r);
+        }
+        _mm256_movemask_ps(_mm256_castsi256_ps(slow)) as u8
     }
 
     /// Epoch day of year y, month mo (1..=12), day d; None for an impossible date.
