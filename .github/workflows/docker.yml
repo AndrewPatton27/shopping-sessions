@@ -22,8 +22,8 @@ jobs:
       - name: Build image
         run: docker build -f ${{ matrix.dockerfile }} -t shopping-sessions:latest .
       - name: Fixtures in container
-        env: { CPUS: "4", MEM: "12g" }
+        env: { CPUS: "2", MEM: "6g" }
         run: python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
       - name: Regression cases in container
-        env: { CPUS: "4", MEM: "12g" }
+        env: { CPUS: "2", MEM: "6g" }
         run: python scripts/run_fixtures.py regress -- scripts/docker_run.sh
