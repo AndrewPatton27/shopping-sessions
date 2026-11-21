@@ -1313,8 +1313,59 @@ struct CBufs {
     coff: Vec<u32>,
     evs: Vec<u64>,
     cks: Vec<CK>,
+    tmp: Vec<u64>,
     segs: Vec<(Ptr<PRec>, usize)>,
     csegs: Vec<(Ptr<PCk>, usize)>,
+}
+
+static KNOBS: LazyLock<String> = LazyLock::new(|| std::env::var("KNOBS").unwrap_or_default());
+static KRT: LazyLock<usize> = LazyLock::new(|| if KNOBS.contains('r') { 256 } else if KNOBS.contains('R') { 1024 } else if KNOBS.contains('s') { 96 } else { usize::MAX });
+static KQ: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('q'));
+
+/// Sorts v by its high 32 bits (ts): LSD radix, 11 bits per pass over ts - min.
+fn radix_ts(v: &mut [u64], tmp: &mut Vec<u64>) {
+    let n = v.len();
+    let (mut lo, mut hi) = (u64::MAX, 0u64);
+    for &x in v.iter() {
+        let t = x >> 32;
+        lo = lo.min(t);
+        hi = hi.max(t);
+    }
+    let passes = ((64 - (hi - lo).leading_zeros()) as usize).div_ceil(11);
+    if passes == 0 {
+        return;
+    }
+    let mut h = [[0u32; 2048]; 3];
+    for &x in v.iter() {
+        let t = (x >> 32) - lo;
+        h[0][(t & 2047) as usize] += 1;
+        h[1][((t >> 11) & 2047) as usize] += 1;
+        h[2][((t >> 22) & 2047) as usize] += 1;
+    }
+    for hp in h.iter_mut().take(passes) {
+        let mut acc = 0u32;
+        for x in hp.iter_mut() {
+            let c = *x;
+            *x = acc;
+            acc += c;
+        }
+    }
+    if tmp.len() < n {
+        tmp.resize(n, 0);
+    }
+    let tmp = &mut tmp[..n];
+    for (p, hp) in h.iter_mut().enumerate().take(passes) {
+        let sh = 11 * p;
+        let (src, dst): (&[u64], &mut [u64]) = if p % 2 == 0 { (&*v, &mut *tmp) } else { (&*tmp, &mut *v) };
+        for &x in src {
+            let d = &mut hp[((((x >> 32) - lo) >> sh) & 2047) as usize];
+            unsafe { *dst.get_unchecked_mut(*d as usize) = x };
+            *d += 1;
+        }
+    }
+    if passes % 2 == 1 {
+        v.copy_from_slice(tmp);
+    }
 }
 
 unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut Local, b: &mut CBufs, agg: &mut Agg) {
@@ -1410,7 +1461,9 @@ unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut
         let ee = b.off[p] as usize;
         let evs = &mut b.evs[es..ee];
         es = ee;
-        if evs.len() > 1 {
+        if evs.len() >= *KRT {
+            radix_ts(evs, &mut b.tmp);
+        } else if evs.len() > 1 {
             evs.sort_unstable();
         }
         let cks: &[CK] = if ncl != 0 {
@@ -1418,7 +1471,12 @@ unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut
             let c = &mut b.cks[cs..ce];
             cs = ce;
             if c.len() > 1 {
-                c.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| key_cmp(x.cid, y.cid)));
+                if *KQ && c.iter().all(|x| x.cid & SLOW == 0) {
+                    // packed keys: integer order is byte-wise order
+                    c.sort_unstable_by_key(|x| ((x.ts as u128) << 64) | x.cid as u128);
+                } else {
+                    c.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| key_cmp(x.cid, y.cid)));
+                }
             }
             c
         } else {
