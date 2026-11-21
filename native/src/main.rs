@@ -1614,7 +1614,7 @@ fn main() {
     let links: OnceLock<Links> = OnceLock::new();
     let next = AtomicUsize::new(0);
     // a thread's share of rows, with headroom; overflow spills
-    let share = |est: u64, np: usize| (est as usize / nt) * 6 / 5 / np + 16;
+    let share = |est: u64, np: usize| (est as usize / nt) * 9 / 8 / np + 16;
     let (per_e, per_c) = (share(est_ev, npe), share(est_ck, npc));
     let mut pes: Vec<Parts<ERec>> = Vec::with_capacity(nt);
     let mut pcs: Vec<Parts<CRec>> = Vec::with_capacity(nt);
