@@ -483,23 +483,43 @@ fn csv_files(dir: &Path) -> Vec<(PathBuf, u64)> {
 struct ERec {
     eid: u64,
     user: u64,
-    ing: i64,
+    ing: u32,
     ts: u32,
+}
+
+/// Ingest time in whole seconds since ING_BASE (low 31 bits; INGM = invalid)
+/// with PUR set on a purchase row. Only the order of copies of one event_id
+/// matters after the late check, and a value that does not fit sends the run
+/// to the legacy pipeline.
+const PUR: u32 = 1 << 31;
+const INGM: u32 = PUR - 1;
+const ING_BASE_DAYS: i64 = 400;
+static BAD_ING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stage A purchase side row, in the partition of its event row: the price
+/// and category of that copy (match on eid + ing).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct PurRec {
+    eid: u64,
+    ing: u32,
     pc: u32,
 }
 
-/// Stage A click row. ord: read order (task << 32 | row), the first copy read
-/// wins. ts: ms since window_start - 7 days. camp: campaign index, DEAD for an
+/// Stage A click row. task: parse task index, the copy of the lowest task wins
+/// (one task is one thread, and its rows sit in read order). ts: ms since window_start - 7 days. camp: campaign index, DEAD for an
 /// invalid click or, after dedup, a repeated copy.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct CRec {
     cid: u64,
     user: u64,
-    ord: u64,
     ts: u32,
-    camp: u32,
+    camp: u16,
+    task: u16,
 }
+
+const DEAD16: u16 = u16::MAX;
 
 /// Stage B event row: person, ts << 32 | pc.
 #[derive(Clone, Copy)]
@@ -703,6 +723,7 @@ impl<T: Copy> Parts<T> {
 struct Cfg {
     ws: i64,
     we: i64,
+    ing_base: i64,
     cal: Cal,
     products: KeyMap,
     unknown_cat: u32,
@@ -750,7 +771,7 @@ unsafe fn rd32(p: *const u8) -> u32 {
     std::ptr::read_unaligned(p as *const u32)
 }
 
-unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
+unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>, pur: &mut Parts<PurRec>) {
     let (ws, we) = (cfg.ws, cfg.we);
 
     const VIEW: u32 = u32::from_le_bytes(*b"view");
@@ -763,7 +784,19 @@ unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &m
         }
         let eid = key_of(base.add(a), b - a);
         let ing = cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX);
-        let mut r = ERec { eid, user: 0, ing, ts: DEAD, pc: 0 };
+        let ing32 = if ing == i64::MAX {
+            INGM
+        } else {
+            let x = (ing - cfg.ing_base).div_euclid(1000);
+            if x < 0 || x >= INGM as i64 {
+                BAD_ING.store(true, std::sync::atomic::Ordering::Relaxed);
+                INGM
+            } else {
+                x as u32
+            }
+        };
+        let mut r = ERec { eid, user: 0, ing: ing32, ts: DEAD };
+        let mut pc = 0u32;
         'v: {
             let (ua, ub) = f[1];
             let (pa, pb) = f[5];
@@ -790,27 +823,30 @@ unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &m
                     None => break 'v,
                 };
                 let cat = key_find(base.add(pa), pb - pa).and_then(|k| cfg.products.get(k)).unwrap_or(cfg.unknown_cat);
-                r.pc = (price << 8) | cat;
+                pc = (price << 8) | cat;
+                r.ing |= PUR;
             }
             r.user = key_of(base.add(ua), ub - ua);
             r.ts = (ts - ws) as u32;
         }
-        out.push(part_of(mix(eid), cfg.pe_bits), r);
+        let p = part_of(mix(eid), cfg.pe_bits);
+        if r.ts != DEAD && r.ing & PUR != 0 {
+            pur.push(p, PurRec { eid, ing: r.ing & INGM, pc });
+        }
+        out.push(p, r);
     });
 }
 
 /// Invalid clicks are kept (camp DEAD): dedup comes before validation.
-unsafe fn parse_clicks(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u64, out: &mut Parts<CRec>) {
+unsafe fn parse_clicks(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u16, out: &mut Parts<CRec>) {
     let (cs, we) = (cfg.ws - WEEK_MS, cfg.we);
-    let mut ord = task << 32;
     scan::<4>(base, lo, hi, |f| {
         let (a, b) = f[0];
         if a == b {
             return;
         }
         let cid = key_of(base.add(a), b - a);
-        let mut r = CRec { cid, user: 0, ord, ts: 0, camp: DEAD };
-        ord += 1;
+        let mut r = CRec { cid, user: 0, ts: 0, camp: DEAD16, task };
         'v: {
             let (ua, ub) = f[1];
             let (ca, cb) = f[2];
@@ -827,7 +863,7 @@ unsafe fn parse_clicks(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u
             };
             r.user = key_of(base.add(ua), ub - ua);
             r.ts = (ts - cs) as u32;
-            r.camp = camp;
+            r.camp = camp as u16;
         }
         out.push(part_of(mix(cid), cfg.pc_bits), r);
     });
@@ -999,6 +1035,11 @@ fn build_links(pairs: &[(u64, u64)]) -> Links {
 
 // ------------------------------------------------------------------ stage B
 
+#[inline(always)]
+fn pk_hash(eid: u64, ing: u32) -> u64 {
+    mix(eid.wrapping_add((ing as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+}
+
 /// Rows ahead whose table slot is prefetched.
 const LOOK: usize = 16;
 
@@ -1042,7 +1083,7 @@ unsafe fn dedup_ev(segs: &[(Ptr<ERec>, usize)], tab: &mut Vec<u64>) {
                 if s >> 40 == tag {
                     let o = segs.get_unchecked(((s >> 28) & 0xFFF) as usize).0 .0.add((s & 0x0FFF_FFFF) as usize);
                     if (*o).eid == eid {
-                        if (*r).ing < (*o).ing {
+                        if ((*r).ing & INGM) < ((*o).ing & INGM) {
                             (*o).ts = DEAD;
                             *t.add(j) = new;
                         } else {
@@ -1057,7 +1098,7 @@ unsafe fn dedup_ev(segs: &[(Ptr<ERec>, usize)], tab: &mut Vec<u64>) {
     }
 }
 
-/// Marks every copy of a click but the first read DEAD.
+/// Marks every copy of a click but the first read DEAD (a later row of the same task is later).
 unsafe fn dedup_ck(segs: &[(Ptr<CRec>, usize)], tab: &mut Vec<u64>) {
     let n: usize = segs.iter().map(|s| s.1).sum();
     if n < 2 {
@@ -1087,11 +1128,11 @@ unsafe fn dedup_ck(segs: &[(Ptr<CRec>, usize)], tab: &mut Vec<u64>) {
                 if s >> 40 == tag {
                     let o = segs.get_unchecked(((s >> 28) & 0xFFF) as usize).0 .0.add((s & 0x0FFF_FFFF) as usize);
                     if (*o).cid == cid {
-                        if (*r).ord < (*o).ord {
-                            (*o).camp = DEAD;
+                        if (*r).task < (*o).task {
+                            (*o).camp = DEAD16;
                             *t.add(j) = new;
                         } else {
-                            (*r).camp = DEAD;
+                            (*r).camp = DEAD16;
                         }
                         break;
                     }
@@ -1102,7 +1143,44 @@ unsafe fn dedup_ck(segs: &[(Ptr<CRec>, usize)], tab: &mut Vec<u64>) {
     }
 }
 
-unsafe fn route_ev(segs: &[(Ptr<ERec>, usize)], links: &Links, qb: u32, out: &mut Parts<PRec>) {
+unsafe fn route_ev(
+    segs: &[(Ptr<ERec>, usize)],
+    psegs: &[(Ptr<PurRec>, usize)],
+    ptab: &mut Vec<u64>,
+    links: &Links,
+    qb: u32,
+    out: &mut Parts<PRec>,
+) {
+    // purchase table: (eid, ing) -> price/category, first copy read wins; word 1 is 0 when free
+    let np: usize = psegs.iter().map(|s| s.1).sum();
+    let mut pmask = 0usize;
+    if np > 0 {
+        let cap = (np * 2).next_power_of_two();
+        if ptab.len() < 2 * cap {
+            ptab.resize(2 * cap, 0);
+        }
+        ptab[..2 * cap].fill(0);
+        pmask = cap - 1;
+        let t = ptab.as_mut_ptr();
+        for &(ptr, len) in psegs {
+            for i in 0..len {
+                let r = *ptr.0.add(i);
+                let mut j = pk_hash(r.eid, r.ing) as usize & pmask;
+                loop {
+                    let w = *t.add(2 * j + 1);
+                    if w == 0 {
+                        *t.add(2 * j) = r.eid;
+                        *t.add(2 * j + 1) = (1 << 63) | ((r.ing as u64) << 32) | r.pc as u64;
+                        break;
+                    }
+                    if *t.add(2 * j) == r.eid && ((w >> 32) as u32 & INGM) == r.ing {
+                        break;
+                    }
+                    j = (j + 1) & pmask;
+                }
+            }
+        }
+    }
     for &(ptr, len) in segs {
         let p = ptr.0;
         for i in 0..len {
@@ -1114,7 +1192,22 @@ unsafe fn route_ev(segs: &[(Ptr<ERec>, usize)], links: &Links, qb: u32, out: &mu
                 continue;
             }
             let person = links.lookup(r.user, mix(r.user));
-            out.push(part_of(mix(person), qb), PRec { person, key: ((r.ts as u64) << 32) | r.pc as u64 });
+            let mut pc = 0u32;
+            if r.ing & PUR != 0 {
+                let t = ptab.as_ptr();
+                let ing = r.ing & INGM;
+                let mut j = pk_hash(r.eid, ing) as usize & pmask;
+                loop {
+                    let w = *t.add(2 * j + 1);
+                    assert!(w != 0);
+                    if *t.add(2 * j) == r.eid && ((w >> 32) as u32 & INGM) == ing {
+                        pc = w as u32;
+                        break;
+                    }
+                    j = (j + 1) & pmask;
+                }
+            }
+            out.push(part_of(mix(person), qb), PRec { person, key: ((r.ts as u64) << 32) | pc as u64 });
         }
     }
 }
@@ -1127,11 +1220,11 @@ unsafe fn route_ck(segs: &[(Ptr<CRec>, usize)], links: &Links, qb: u32, out: &mu
                 links.prefetch(mix((*p.add(i + LOOK)).user));
             }
             let r = *p.add(i);
-            if r.camp == DEAD {
+            if r.camp == DEAD16 {
                 continue;
             }
             let person = links.lookup(r.user, mix(r.user));
-            out.push(part_of(mix(person), qb), PCk { person, cid: r.cid, ts: r.ts, camp: r.camp });
+            out.push(part_of(mix(person), qb), PCk { person, cid: r.cid, ts: r.ts, camp: r.camp as u32 });
         }
     }
 }
@@ -1812,6 +1905,7 @@ fn main() {
     let cfg = Cfg {
         ws,
         we,
+        ing_base: ws - ING_BASE_DAYS * DAY_MS,
         cal: Cal::new(ws - WEEK_MS, we + WEEK_MS),
         products,
         unknown_cat,
@@ -1840,10 +1934,14 @@ fn main() {
     // ---- stage A: parse into id partitions; thread 0 first builds the links
     let links: OnceLock<Links> = OnceLock::new();
     let next = AtomicUsize::new(0);
-    // slabs of about half a thread's share of the stage-A rows
-    let slab_a = ((est_ev * 32 + est_ck * 32) as usize / nt).max(1 << 22) / 2;
+    // slabs of about half a thread's share of the stage-A rows (24 B events/clicks, 16 B purchase side rows)
+    let slab_a = ((est_ev * 24 + est_ev / 16 * 16 + est_ck * 24) as usize / nt).max(1 << 22) / 2;
     let mut pes: Vec<Parts<ERec>> = Vec::with_capacity(nt);
     let mut pcs: Vec<Parts<CRec>> = Vec::with_capacity(nt);
+    let mut pps: Vec<Parts<PurRec>> = Vec::with_capacity(nt);
+    if ncamp >= DEAD16 as usize || tasks.len() >= DEAD16 as usize {
+        legacy::run();
+    }
     std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nt)
             .map(|t| {
@@ -1866,6 +1964,7 @@ fn main() {
                     let arena = Arena::leak(slab_a);
                     let mut pe = Parts::<ERec>::new(npe, arena);
                     let mut pc = Parts::<CRec>::new(npc, arena);
+                    let mut pp = Parts::<PurRec>::new(npe, arena);
                     loop {
                         let i = next.fetch_add(1, AO::Relaxed);
                         if i >= tasks.len() {
@@ -1884,23 +1983,28 @@ fn main() {
                         let base = buf.as_ptr();
                         unsafe {
                             match tk.kind {
-                                Kind::Events => parse_events(cfg, base, lo, hi, &mut pe),
-                                Kind::Clicks => parse_clicks(cfg, base, lo, hi, i as u64, &mut pc),
+                                Kind::Events => parse_events(cfg, base, lo, hi, &mut pe, &mut pp),
+                                Kind::Clicks => parse_clicks(cfg, base, lo, hi, i as u16, &mut pc),
                             }
                         }
                     }
                     pe.flush();
                     pc.flush();
-                    (pe, pc)
+                    pp.flush();
+                    (pe, pc, pp)
                 })
             })
             .collect();
         for h in hs {
-            let (pe, pc) = h.join().expect("parse thread");
+            let (pe, pc, pp) = h.join().expect("parse thread");
             pes.push(pe);
             pcs.push(pc);
+            pps.push(pp);
         }
     });
+    if BAD_ING.load(AO::Relaxed) {
+        legacy::run();
+    }
     let links = links.into_inner().expect("links");
     let t_a = t0.elapsed();
 
@@ -1916,6 +2020,12 @@ fn main() {
         border.sort_unstable_by(|a, b| b.cmp(a));
         let mut esegs: Vec<Vec<(Ptr<ERec>, usize)>> = vec![Vec::new(); npe];
         let mut csegs: Vec<Vec<(Ptr<CRec>, usize)>> = vec![Vec::new(); npc];
+        let mut psegs: Vec<Vec<(Ptr<PurRec>, usize)>> = vec![Vec::new(); npe];
+        for x in pps.iter() {
+            for (p, v) in psegs.iter_mut().enumerate() {
+                x.segs(p, v);
+            }
+        }
         for x in pes.iter() {
             for (p, v) in esegs.iter_mut().enumerate() {
                 x.segs(p, v);
@@ -1931,7 +2041,7 @@ fn main() {
         std::thread::scope(|sc| {
             let hs: Vec<_> = (0..nt)
                 .map(|_| {
-                    let (esegs, csegs, next, links, border) = (&esegs, &csegs, &next, &links, &border);
+                    let (esegs, csegs, psegs, next, links, border) = (&esegs, &csegs, &psegs, &next, &links, &border);
                     sc.spawn(move || {
                         // outputs go first into chunks of partitions this
                         // thread has consumed
@@ -1939,6 +2049,7 @@ fn main() {
                         let mut oe = Parts::<PRec>::new(nq, arena);
                         let mut oc = Parts::<PCk>::new(nq, arena);
                         let mut tab: Vec<u64> = Vec::new();
+                        let mut ptab: Vec<u64> = Vec::new();
                         loop {
                             let i = next.fetch_add(1, AO::Relaxed);
                             if i >= border.len() {
@@ -1949,8 +2060,9 @@ fn main() {
                             unsafe {
                                 if p < npe {
                                     dedup_ev(&esegs[p], &mut tab);
-                                    route_ev(&esegs[p], links, qb, &mut oe);
+                                    route_ev(&esegs[p], &psegs[p], &mut ptab, links, qb, &mut oe);
                                     (*arena).free.extend(esegs[p].iter().map(|s| s.0 .0 as *mut u8));
+                                    (*arena).free.extend(psegs[p].iter().map(|s| s.0 .0 as *mut u8));
                                 } else {
                                     dedup_ck(&csegs[p - npe], &mut tab);
                                     route_ck(&csegs[p - npe], links, qb, &mut oc);
