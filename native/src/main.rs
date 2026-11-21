@@ -995,6 +995,8 @@ const LOOK: usize = 16;
 static KNOBS: LazyLock<String> = LazyLock::new(|| std::env::var("KNOBS").unwrap_or_default());
 static KA: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('a'));
 static KF: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('f'));
+static KE: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('e'));
+static KL: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('l'));
 static KD: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('d'));
 
 unsafe fn route_ev(segs: &[(Ptr<ERec>, usize)], links: &Links, qb: u32, out: &mut Parts<PRec>) {
@@ -1073,6 +1075,7 @@ struct UOut {
 }
 
 struct Agg {
+    nb: usize,
     ws: i64,
     cs: i64,
     day_min: i64,
@@ -1384,6 +1387,74 @@ struct Local {
     slots: Vec<u32>,
     mask: usize,
     keys: Vec<u64>,
+    sk: Vec<u64>,
+}
+
+/// Knob l: slot keys inline (sk), id in slots; the id load does not depend on the key load.
+impl Local {
+    fn reset2(&mut self, hint: usize) {
+        let cap = (hint / 8).max(64).next_power_of_two();
+        if self.sk.len() < cap {
+            self.sk.resize(cap, 0);
+            self.slots.resize(cap.max(self.slots.len()), 0);
+        }
+        self.sk[..cap].fill(0);
+        self.mask = cap - 1;
+        self.keys.clear();
+    }
+    fn grow2(&mut self) {
+        let cap = (self.mask + 1) * 2;
+        if self.sk.len() < cap {
+            self.sk.resize(cap, 0);
+            self.slots.resize(cap.max(self.slots.len()), 0);
+        }
+        self.sk[..cap].fill(0);
+        self.mask = cap - 1;
+        for (i, &k) in self.keys.iter().enumerate() {
+            let mut j = mix(k) as usize & self.mask;
+            while self.sk[j] != 0 {
+                j = (j + 1) & self.mask;
+            }
+            self.sk[j] = k;
+            self.slots[j] = i as u32;
+        }
+    }
+    #[inline(always)]
+    fn get_or_insert2(&mut self, k: u64) -> u32 {
+        let mut j = mix(k) as usize & self.mask;
+        loop {
+            let s = unsafe { *self.sk.get_unchecked(j) };
+            if s == k {
+                return unsafe { *self.slots.get_unchecked(j) };
+            }
+            if s == 0 {
+                break;
+            }
+            j = (j + 1) & self.mask;
+        }
+        let id = self.keys.len() as u32;
+        self.keys.push(k);
+        self.sk[j] = k;
+        self.slots[j] = id;
+        if self.keys.len() * 2 > self.mask + 1 {
+            self.grow2();
+        }
+        id
+    }
+    #[inline(always)]
+    fn get2(&self, k: u64) -> u32 {
+        let mut j = mix(k) as usize & self.mask;
+        loop {
+            let s = unsafe { *self.sk.get_unchecked(j) };
+            if s == k {
+                return unsafe { *self.slots.get_unchecked(j) };
+            }
+            if s == 0 {
+                return NONE;
+            }
+            j = (j + 1) & self.mask;
+        }
+    }
 }
 
 impl Local {
@@ -1456,6 +1527,8 @@ struct CBufs {
     coff: Vec<u32>,
     evs: Vec<u64>,
     cks: Vec<CK>,
+    hist: Vec<u32>,
+    tmp: Vec<(u64, u32)>,
     segs: Vec<(Ptr<PRec>, usize)>,
     csegs: Vec<(Ptr<PCk>, usize)>,
 }
@@ -1470,12 +1543,13 @@ unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut
         return;
     }
     assert!(n < u32::MAX as usize);
-    local.reset(n);
+    let kl = *KL;
+    if kl { local.reset2(n) } else { local.reset(n) }
     b.ids.clear();
     b.off.clear();
     for &(ptr, len) in &b.segs {
         for e in std::slice::from_raw_parts(ptr.0, len) {
-            let id = local.get_or_insert(e.person);
+            let id = if kl { local.get_or_insert2(e.person) } else { local.get_or_insert(e.person) };
             if id as usize == b.off.len() {
                 b.off.push(0);
             }
@@ -1494,6 +1568,41 @@ unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut
     b.off.push(acc);
     b.evs.clear();
     b.evs.resize(n, 0);
+    let ke = *KE;
+    if ke {
+        // stable by 65 s time bucket, then stable by person: each person's
+        // events come out nearly sorted
+        b.hist.clear();
+        b.hist.resize(agg.nb + 1, 0);
+        for &(ptr, len) in &b.segs {
+            for e in std::slice::from_raw_parts(ptr.0, len) {
+                *b.hist.get_unchecked_mut((e.key >> 48) as usize) += 1;
+            }
+        }
+        let mut acc = 0u32;
+        for x in b.hist.iter_mut() {
+            let c = *x;
+            *x = acc;
+            acc += c;
+        }
+        b.tmp.clear();
+        b.tmp.resize(n, (0, 0));
+        let mut k = 0usize;
+        for &(ptr, len) in &b.segs {
+            for e in std::slice::from_raw_parts(ptr.0, len) {
+                let id = *b.ids.get_unchecked(k);
+                k += 1;
+                let pos = b.hist.get_unchecked_mut((e.key >> 48) as usize);
+                *b.tmp.get_unchecked_mut(*pos as usize) = (e.key, id);
+                *pos += 1;
+            }
+        }
+        for &(key, id) in &b.tmp {
+            let pos = b.off.get_unchecked_mut(id as usize);
+            *b.evs.get_unchecked_mut(*pos as usize) = key;
+            *pos += 1;
+        }
+    } else {
     let mut k = 0usize;
     for &(ptr, len) in &b.segs {
         for e in std::slice::from_raw_parts(ptr.0, len) {
@@ -1503,6 +1612,7 @@ unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut
             *b.evs.get_unchecked_mut(*pos as usize) = e.key;
             *pos += 1;
         }
+    }
     }
     // off[id] is now the end of person id; the start is off[id-1] (or 0)
 
@@ -1516,7 +1626,7 @@ unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut
     let mut ncl = 0u32;
     for &(ptr, len) in &b.csegs {
         for c in std::slice::from_raw_parts(ptr.0, len) {
-            let id = local.get(c.person);
+            let id = if kl { local.get2(c.person) } else { local.get(c.person) };
             if id != NONE {
                 b.coff[id as usize] += 1;
                 ncl += 1;
@@ -1554,7 +1664,19 @@ unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut
         let evs = &mut b.evs[es..ee];
         es = ee;
         if evs.len() > 1 {
-            evs.sort_unstable();
+            if ke {
+                for i in 1..evs.len() {
+                    let x = evs[i];
+                    let mut j = i;
+                    while j > 0 && evs[j - 1] > x {
+                        evs[j] = evs[j - 1];
+                        j -= 1;
+                    }
+                    evs[j] = x;
+                }
+            } else {
+                evs.sort_unstable();
+            }
         }
         let cks: &[CK] = if ncl != 0 {
             let ce = b.coff[p] as usize;
@@ -1933,6 +2055,7 @@ fn main() {
                     (&next, &qes, &qcs, &order, &cat_rank, &cat_names, &ud_dir);
                 sc.spawn(move || {
                     let mut agg = Agg {
+                        nb: ((we - ws) >> 16) as usize + 1,
                         ws,
                         cs: ws - WEEK_MS,
                         day_min,
@@ -1956,7 +2079,7 @@ fn main() {
                         out: UOut::default(),
                         name: Vec::new(),
                     };
-                    let mut local = Local { slots: Vec::new(), mask: 0, keys: Vec::new() };
+                    let mut local = Local { slots: Vec::new(), mask: 0, keys: Vec::new(), sk: Vec::new() };
                     let mut bufs = CBufs::default();
                     loop {
                         let i = next.fetch_add(1, AO::Relaxed);
