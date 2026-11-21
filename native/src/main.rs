@@ -914,7 +914,6 @@ fn build_links(pairs: &[(u64, u64)]) -> Links {
     let mask = cap - 1;
     let mut slots = vec![(0u64, 0u64); cap];
     let mut keys: Vec<u64> = Vec::with_capacity(np + np / 2);
-    let mut slotpos: Vec<u32> = Vec::with_capacity(keys.capacity());
     let mut parent: Vec<u32> = Vec::with_capacity(keys.capacity());
     assert!(cap <= u32::MAX as usize);
 
@@ -951,7 +950,6 @@ fn build_links(pairs: &[(u64, u64)]) -> Links {
                         let id = keys.len() as u32;
                         *s = (k, id as u64);
                         keys.push(k);
-                        slotpos.push(j as u32);
                         parent.push(id);
                         break id;
                     }
@@ -970,7 +968,6 @@ fn build_links(pairs: &[(u64, u64)]) -> Links {
         }
     }
     drop(slots);
-    drop(slotpos);
     let mut moved: Vec<(u64, u64)> = Vec::new();
     for i in 0..keys.len() as u32 {
         let r = find(&mut parent, i);
@@ -1887,7 +1884,8 @@ fn main() {
                 sc.spawn(move || {
                     let mut buf: Vec<u8> = Vec::with_capacity(CHUNK as usize + 8192);
                     if t == 0 {
-                        let mut pairs: Vec<(u64, u64)> = Vec::new();
+                        // about 20 bytes per link line: reserve instead of doubling
+                        let mut pairs: Vec<(u64, u64)> = Vec::with_capacity((ln_files.iter().map(|f| f.1).sum::<u64>() / 18) as usize);
                         for tk in ltasks {
                             let (path, size) = &ln_files[tk.file];
                             let mut f = File::open(path).unwrap_or_else(|e| panic!("open {}: {}", path.display(), e));
