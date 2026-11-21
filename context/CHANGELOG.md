@@ -59,3 +59,10 @@
 - 2026-11-21: BB-18B5A4F2 (exp-mem) 0.87 s, official rank 69/290 (board prints ranks; ties marked TIE; earlier self-computed ranks undercounted ties).
 - 2026-11-21: exp-rec (peer session, 24 B ERec/CRec): verify + dev MATCH (worktree wt-rec); CI same-run 20M median 1181 vs main 1164 ms (neutral/slightly worse). Parked as scorer candidate.
 - 2026-11-21: exp-mem2 merged (chunked arenas via Parts with stage-B chunk reuse; scan field bounds from quote-adjusted masks). CI -2.5%, peak RSS 1.97 -> 1.16 GB. Lead: META + dev + fuzz 1001-1200 PASS; agent 60M MATCH.
+- 2026-11-21: BB-C88B59A4 (exp-mem2) 0.84 s, rank 70/296. Best so far.
+- 2026-11-21: exp-rec2 (24 B records ported onto main, 65dd67d): gates PASS; CI -1.6% slower (noise). Submitting as scorer test at 21:12Z (cannot lower best).
+- 2026-11-21: exp-mem3 fast-forwarded to main (2ec16fe): per-stage RSS/faults in stage line, user_daily streamed in 64K-row groups, leaner link build. Peak RSS 1.17 -> 1.03 GB, CI ~-1.5%. Lead: META + dev + fuzz 1201-1400 PASS. Submitting instead of exp-rec2 at 21:13Z.
+- 2026-11-21: BB-2286A99D (exp-mem3) 0.84 s = best, rank 72/308. Plateau ~0.84. Next slot 22:13Z: exp-rec2 (24 B records) scorer test.
+- 2026-11-21: BB-A41813B3 (exp-rec2) 0.84 s = no change; 24 B records not merged. Plateau 0.84; rank drifting (76/327) as others improve.
+- 2026-11-21: Peer exp-rec2 patch (positional purchase join, 4 B PurRec): exact, no local gain; rejected. Record-size path closed (scorer showed no gain for 24 B records).
+- 2026-11-21: exp-simd merged (two-stage AVX-512 parse: vpcompressb field offsets, 16-lane batch ts/ingest/ID parse with scalar fallback; AVX2 path unchanged). CI same-run 20M -9% (943 vs 1038). verify-linux CI with AVX-512 active: full verify + META + 400 fuzz PASS. Local AVX2: META+fuzz, 10M+60M MATCH (agent).

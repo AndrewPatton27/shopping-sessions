@@ -6,3 +6,6 @@ ts	id	commit	engine	result	note
 2026-11-21T17:09Z	BB-6695D6F9	e8ebf0e	rust	0.88 s (rank 60/282)	exp-bc; scorer -12% vs CI -3.3% (Xeon likes branch-free probe)
 2026-11-21T18:10Z	BB-84907B35	914e763	rust	0.92 s (best stays 0.88)	exp-br branch removals: no gain on scorer -> reverted
 2026-11-21T19:11Z	BB-18B5A4F2	cfc02cb	rust	0.87 s (official rank 69/290)	exp-mem; memory-traffic cuts pay a little on scorer
+2026-11-21T20:12Z	BB-C88B59A4	3da92db	rust	0.84 s (official rank 70/296)	exp-mem2 chunked arenas + field bounds
+2026-11-21T21:13Z	BB-2286A99D	2ec16fe	rust	0.84 s (rank 72/308)	exp-mem3 peak RSS cut; time unchanged
+2026-11-21T22:14Z	BB-A41813B3	65dd67d	rust	0.84 s (rank 76/327)	exp-rec2 24 B records: no change on scorer; not merged
