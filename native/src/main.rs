@@ -535,30 +535,79 @@ unsafe impl<T> Sync for Ptr<T> {}
 
 /// One thread's rows, partitioned: partition p fills buf[start[p]..end[p]),
 /// then spills to over[p].
+///
+/// With staging on, rows first collect in a cache-resident 192 B line group
+/// per partition; a full group goes to buf with non-temporal stores (no read
+/// for ownership of the destination lines, no cache pollution). Regions start
+/// 64 B aligned and advance by whole groups. `flush` drains partial groups
+/// and must run before the rows are read, on the writing thread.
 struct Parts<T: Copy> {
     buf: Vec<T>,
     ce: Vec<(u32, u32)>,
     start: Vec<u32>,
     over: Vec<Vec<T>>,
+    stage: Vec<Stage>,
+    cnt: Vec<u8>,
 }
+
+const STAGE: usize = 192;
+
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Stage([u8; STAGE]);
 
 unsafe impl<T: Copy> Send for Parts<T> {}
 unsafe impl<T: Copy> Sync for Parts<T> {}
 
 impl<T: Copy> Parts<T> {
+    const K: usize = STAGE / std::mem::size_of::<T>();
+
     fn new(np: usize, per: usize) -> Parts<T> {
-        let per = per.min((u32::MAX as usize - 1) / np.max(1));
-        let buf = Vec::with_capacity(np * per);
+        const { assert!(STAGE % std::mem::size_of::<T>() == 0 && STAGE / std::mem::size_of::<T>() < 256) };
+        let k = Self::K;
+        let per = per.min((u32::MAX as usize - 1) / np.max(1) - k);
+        let mut stage = Vec::new();
+        let mut shift = 0usize;
+        let mut per = per;
+        let buf: Vec<T>;
+        if *KN {
+            per = per.div_ceil(k) * k;
+            buf = Vec::with_capacity(np * per + k);
+            let base = buf.as_ptr() as usize;
+            let sz = std::mem::size_of::<T>();
+            while shift < k && (base + shift * sz) % 64 != 0 {
+                shift += 1;
+            }
+            if shift < k {
+                stage = vec![Stage([0; STAGE]); np];
+            } else {
+                shift = 0;
+            }
+        } else {
+            buf = Vec::with_capacity(np * per);
+        }
         Parts {
             buf,
-            ce: (0..np).map(|p| ((p * per) as u32, ((p + 1) * per) as u32)).collect(),
-            start: (0..np).map(|p| (p * per) as u32).collect(),
+            ce: (0..np).map(|p| ((shift + p * per) as u32, (shift + (p + 1) * per) as u32)).collect(),
+            start: (0..np).map(|p| (shift + p * per) as u32).collect(),
             over: (0..np).map(|_| Vec::new()).collect(),
+            cnt: vec![0; if stage.is_empty() { 0 } else { np }],
+            stage,
         }
     }
     #[inline(always)]
     fn push(&mut self, p: usize, v: T) {
         unsafe {
+            if !self.stage.is_empty() {
+                let c = self.cnt.get_unchecked_mut(p);
+                (self.stage.get_unchecked_mut(p).0.as_mut_ptr() as *mut T).add(*c as usize).write(v);
+                *c += 1;
+                if *c as usize == Self::K {
+                    *c = 0;
+                    self.group(p);
+                }
+                return;
+            }
             let ce = self.ce.get_unchecked_mut(p);
             if ce.0 < ce.1 {
                 // buf's capacity covers every region; only written slots are read
@@ -568,6 +617,51 @@ impl<T: Copy> Parts<T> {
                 self.over.get_unchecked_mut(p).push(v);
             }
         }
+    }
+    /// Moves partition p's full stage group to its region (or spills it).
+    #[inline(always)]
+    unsafe fn group(&mut self, p: usize) {
+        let k = Self::K;
+        let ce = self.ce.get_unchecked_mut(p);
+        let src = self.stage.get_unchecked(p).0.as_ptr();
+        if (ce.1 - ce.0) as usize >= k {
+            let dst = self.buf.as_mut_ptr().add(ce.0 as usize) as *mut u8;
+            #[cfg(target_arch = "x86_64")]
+            {
+                use std::arch::x86_64::*;
+                for i in 0..STAGE / 16 {
+                    _mm_stream_si128(dst.add(16 * i) as *mut __m128i, _mm_load_si128(src.add(16 * i) as *const __m128i));
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            std::ptr::copy_nonoverlapping(src, dst, STAGE);
+            ce.0 += k as u32;
+        } else {
+            self.drain(p, k);
+        }
+    }
+    #[cold]
+    unsafe fn drain(&mut self, p: usize, n: usize) {
+        let src = self.stage.get_unchecked(p).0.as_ptr() as *const T;
+        let ce = self.ce.get_unchecked_mut(p);
+        let m = n.min((ce.1 - ce.0) as usize);
+        std::ptr::copy_nonoverlapping(src, self.buf.as_mut_ptr().add(ce.0 as usize), m);
+        ce.0 += m as u32;
+        self.over.get_unchecked_mut(p).extend_from_slice(std::slice::from_raw_parts(src.add(m), n - m));
+    }
+    /// Drains the partial stage groups; orders the non-temporal stores.
+    fn flush(&mut self) {
+        for p in 0..self.cnt.len() {
+            let n = self.cnt[p] as usize;
+            if n > 0 {
+                self.cnt[p] = 0;
+                unsafe { self.drain(p, n) };
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence()
+        };
     }
     fn len(&self, p: usize) -> usize {
         (self.ce[p].0 - self.start[p]) as usize + self.over[p].len()
@@ -1318,6 +1412,7 @@ struct CBufs {
     csegs: Vec<(Ptr<PCk>, usize)>,
 }
 
+static KN: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('n'));
 static KNOBS: LazyLock<String> = LazyLock::new(|| std::env::var("KNOBS").unwrap_or_default());
 static KRT: LazyLock<usize> = LazyLock::new(|| if KNOBS.contains('r') { 256 } else if KNOBS.contains('R') { 1024 } else if KNOBS.contains('s') { 96 } else { usize::MAX });
 static KQ: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('q'));
@@ -1757,6 +1852,8 @@ fn main() {
                             }
                         }
                     }
+                    pe.flush();
+                    pc.flush();
                     (pe, pc)
                 })
             })
@@ -1819,6 +1916,8 @@ fn main() {
                                 }
                             }
                         }
+                        oe.flush();
+                        oc.flush();
                         (oe, oc)
                     })
                 })
