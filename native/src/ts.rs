@@ -124,6 +124,40 @@ fn parse8(v: u64) -> u64 {
     (x.wrapping_mul(10000).wrapping_add(x >> 32)) & 0xFFFF_FFFF
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[repr(C)]
+union U {
+    b: [u8; 16],
+    w: [i16; 8],
+    v: std::arch::x86_64::__m128i,
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+struct M(std::arch::x86_64::__m128i);
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+unsafe impl Sync for M {}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+const fn m8(b: [u8; 16]) -> M {
+    M(unsafe { U { b }.v })
+}
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+const fn m16(w: [i16; 8]) -> M {
+    M(unsafe { U { w }.v })
+}
+
+/// Digit pairs of "-MM-DDTHH:MM:SS?" -> MM DD HH MM SS.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static PAIRS: M = m8([1, 2, 4, 5, 7, 8, 10, 11, 13, 14, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80]);
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static TENS: M = m8([10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0]);
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static SEPS: M = m8([b'-', 0, 0, b'-', 0, 0, b'T', 0, 0, b':', 0, 0, b':', 0, 0, 0]);
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static MAXS: M = m16([12, 31, 23, 59, 59, 0, 0, 0]);
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static MINS: M = m16([1, 1, 0, 0, 0, 0, 0, 0]);
+
 pub struct Cal {
     y0: i64,
     /// Epoch day of the 1st of each month from January of y0.
@@ -183,6 +217,106 @@ impl Cal {
         Some((parse8(lo) * 100_000_000 + parse8(hi)) as i64)
     }
 
+    /// Epoch day of year y, month mo (1..=12), day d; None for an impossible date.
+    #[inline(always)]
+    fn day_of(&self, y: i64, mo: i64, d: i64) -> Option<i64> {
+        let k = (y - self.y0) * 12 + mo - 1;
+        if (k as u64) < self.first.len() as u64 {
+            if d < 1 || d > self.dim[k as usize] as i64 {
+                return None;
+            }
+            Some(self.first[k as usize] + d - 1)
+        } else {
+            let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+            let dim = if mo == 2 && leap { 29 } else { MDAYS[(mo - 1) as usize] as i64 };
+            if d < 1 || d > dim {
+                return None;
+            }
+            Some(days_from_civil(y, mo, d))
+        }
+    }
+
+    /// An F1 value the rules guarantee valid (ingest_ts): no checks. Any other
+    /// length takes the full parser.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline(always)]
+    pub unsafe fn f1_trusted(&self, p: *const u8, n: usize) -> Option<i64> {
+        use std::arch::x86_64::*;
+        if n != 20 {
+            return self.parse(p, n);
+        }
+        let v = _mm_loadu_si128(p.add(4) as *const __m128i);
+        let t = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+        let vals = _mm_maddubs_epi16(_mm_shuffle_epi8(t, PAIRS.0), TENS.0);
+        let lo = _mm_cvtsi128_si64(vals) as u64;
+        let se = _mm_extract_epi16::<4>(vals) as i64;
+        let y4 = std::ptr::read_unaligned(p as *const u32).wrapping_sub(0x3030_3030);
+        let y = ((y4 & 0xFF) * 1000 + ((y4 >> 8) & 0xFF) * 100 + ((y4 >> 16) & 0xFF) * 10 + (y4 >> 24)) as i64;
+        let (mo, d, h, mi) = ((lo & 0xFFFF) as i64, ((lo >> 16) & 0xFFFF) as i64, ((lo >> 32) & 0xFFFF) as i64, (lo >> 48) as i64);
+        let k = (y - self.y0) * 12 + mo - 1;
+        if (k as u64) >= self.first.len() as u64 {
+            return self.parse(p, n);
+        }
+        Some((self.first[k as usize] + d - 1) * DAY_MS + ((h * 60 + mi) * 60 + se) * 1000)
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[inline(always)]
+    pub unsafe fn f1_trusted(&self, p: *const u8, n: usize) -> Option<i64> {
+        self.parse(p, n)
+    }
+
+    /// F1/F2 (n == 20 or 25, byte 19 already checked): SSE checks of the
+    /// separators and digits of bytes 4..19, digit pairs combined by maddubs.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline(always)]
+    unsafe fn iso(&self, p: *const u8, n: usize) -> Option<i64> {
+        use std::arch::x86_64::*;
+        // v = "-MM-DDTHH:MM:SS?" (bytes 4..20)
+        let v = _mm_loadu_si128(p.add(4) as *const __m128i);
+        let t = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+        let dig = _mm_cmpeq_epi8(_mm_min_epu8(t, _mm_set1_epi8(9)), t);
+        let sep = _mm_cmpeq_epi8(v, SEPS.0);
+        let m = (_mm_movemask_epi8(dig) as u32 & 0x6DB6) | (_mm_movemask_epi8(sep) as u32 & 0x1249);
+        let y4 = std::ptr::read_unaligned(p as *const u32);
+        let yd = y4.wrapping_sub(0x3030_3030);
+        let ydig = (y4 & 0xF0F0_F0F0) == 0x3030_3030 && (y4.wrapping_add(0x0606_0606) & 0xF0F0_F0F0) == 0x3030_3030;
+        if m != 0x7FFF || !ydig {
+            return None;
+        }
+        let vals = _mm_maddubs_epi16(_mm_shuffle_epi8(t, PAIRS.0), TENS.0);
+        let bad = _mm_or_si128(_mm_cmpgt_epi16(vals, MAXS.0), _mm_cmpgt_epi16(MINS.0, vals));
+        if _mm_movemask_epi8(bad) != 0 {
+            return None;
+        }
+        let lo = _mm_cvtsi128_si64(vals) as u64;
+        let se = _mm_extract_epi16::<4>(vals) as i64;
+        let y = ((yd & 0xFF) * 1000 + ((yd >> 8) & 0xFF) * 100 + ((yd >> 16) & 0xFF) * 10 + (yd >> 24)) as i64;
+        let (mo, d, h, mi) = ((lo & 0xFFFF) as i64, ((lo >> 16) & 0xFFFF) as i64, ((lo >> 32) & 0xFFFF) as i64, (lo >> 48) as i64);
+        let day = self.day_of(y, mo, d)?;
+        let mut ms = day * DAY_MS + ((h * 60 + mi) * 60 + se) * 1000;
+        if n == 25 {
+            let s = std::slice::from_raw_parts(p, 25);
+            let dg = |i: usize| s[i].wrapping_sub(b'0') as i64;
+            if dg(20) > 9 || dg(21) > 9 || s[22] != b':' || dg(23) > 9 || dg(24) > 9 {
+                return None;
+            }
+            let oh = dg(20) * 10 + dg(21);
+            let om = dg(23) * 10 + dg(24);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off = (oh * 60 + om) * 60_000;
+            if s[19] == b'+' {
+                ms -= off;
+            } else {
+                ms += off;
+            }
+        }
+        Some(ms)
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     #[inline(always)]
     unsafe fn iso(&self, p: *const u8, n: usize) -> Option<i64> {
         // a: YYYY-MM-   b: DDTHH:MM   c: :SS? (+ offset bytes 20..25)

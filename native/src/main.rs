@@ -308,7 +308,7 @@ unsafe fn scan<const NF: usize>(base: *const u8, lo: usize, hi: usize, mut row: 
             pos = next;
             continue;
         }
-        if q != 0 {
+        {
             let sp = c | nlb;
             let qs = q & ((c << 1) | 1);
             let qe = q & (sp >> 1);
@@ -660,8 +660,8 @@ unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &m
         if a == b {
             return;
         }
-        let eid = key_of(base.add(a), b - a);
-        let ing = cfg.cal.parse(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX);
+        let eid = if exp == 8 { (a as u64) | 1 } else { key_of(base.add(a), b - a) };
+        let ing = if exp == 6 { 1 } else { cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX) };
         let mut r = ERec { eid, user: 0, ing, ts: DEAD, pc: 0 };
         'v: {
             let (ua, ub) = f[1];
@@ -672,13 +672,14 @@ unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &m
             }
             let tl = tb - ta;
             let purchase = tl == 8 && std::ptr::read_unaligned(base.add(ta) as *const u64) == PURCHASE;
-            if !purchase && !(tl == 4 && (rd32(base.add(ta)) == VIEW || rd32(base.add(ta)) == CART)) {
+            let w = rd32(base.add(ta));
+            if !purchase & !((tl == 4) & ((w == VIEW) | (w == CART))) {
                 break 'v;
             }
-            let ts = match cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0) {
+            let ts = if exp == 7 { ws + (ua as i64 & 0xFFFFF) } else { match cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0) {
                 Some(t) if t >= ws && t < we => t,
                 _ => break 'v,
-            };
+            } };
             if ing.saturating_sub(ts) > DAY_MS {
                 break 'v;
             }
@@ -690,10 +691,11 @@ unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &m
                 let cat = key_find(base.add(pa), pb - pa).and_then(|k| cfg.products.get(k)).unwrap_or(cfg.unknown_cat);
                 r.pc = (price << 8) | cat;
             }
-            r.user = key_of(base.add(ua), ub - ua);
+            r.user = if exp == 8 { ua as u64 | 1 } else { key_of(base.add(ua), ub - ua) };
             r.ts = (ts - ws) as u32;
         }
-        if exp == 1 { std::hint::black_box(r); return; }
+        if exp == 1 || exp >= 6 { std::hint::black_box(r); return; }
+        if exp == 4 { out.push(0, r); return; }
         out.push(part_of(mix(eid), cfg.pe_bits), r);
     });
 }
@@ -725,25 +727,31 @@ unsafe fn parse_clicks(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &m
 
 // ------------------------------------------------------------------ links
 
-/// user ID -> person name (the byte-wise smallest ID of its component).
+/// user ID -> person name (the byte-wise smallest ID of its component), for
+/// the IDs that are not their own person's name; any other ID maps to itself.
+/// Linear probing over `cap` slots (not a power of two: kept small for cache).
 struct Links {
     slots: Vec<(u64, u64)>,
-    mask: usize,
+    cap: usize,
 }
 
 impl Links {
     #[inline(always)]
+    fn home(&self, h: u64) -> usize {
+        ((h as u128 * self.cap as u128) >> 64) as usize
+    }
+    #[inline(always)]
     fn prefetch(&self, h: u64) {
-        if !self.slots.is_empty() {
-            prefetch(unsafe { self.slots.as_ptr().add(h as usize & self.mask) });
+        if self.cap != 0 {
+            prefetch(unsafe { self.slots.as_ptr().add(self.home(h)) });
         }
     }
     #[inline(always)]
     fn lookup(&self, k: u64, h: u64) -> u64 {
-        if self.slots.is_empty() {
+        if self.cap == 0 {
             return k;
         }
-        let mut j = h as usize & self.mask;
+        let mut j = self.home(h);
         loop {
             let s = unsafe { self.slots.get_unchecked(j) };
             if s.0 == k {
@@ -752,7 +760,10 @@ impl Links {
             if s.0 == 0 {
                 return k;
             }
-            j = (j + 1) & self.mask;
+            j += 1;
+            if j == self.cap {
+                j = 0;
+            }
         }
     }
 }
@@ -774,7 +785,7 @@ unsafe fn parse_links(base: *const u8, lo: usize, hi: usize, pairs: &mut Vec<(u6
 fn build_links(pairs: &[(u64, u64)]) -> Links {
     let np = pairs.len();
     if np == 0 {
-        return Links { slots: Vec::new(), mask: 0 };
+        return Links { slots: Vec::new(), cap: 0 };
     }
     let cap = (np * 2 + np / 2).max(16).next_power_of_two();
     let mask = cap - 1;
@@ -835,11 +846,28 @@ fn build_links(pairs: &[(u64, u64)]) -> Links {
             }
         }
     }
+    drop(slots);
+    drop(slotpos);
+    let mut moved: Vec<(u64, u64)> = Vec::new();
     for i in 0..keys.len() as u32 {
         let r = find(&mut parent, i);
-        slots[slotpos[i as usize] as usize].1 = keys[r as usize];
+        if r != i {
+            moved.push((keys[i as usize], keys[r as usize]));
+        }
     }
-    Links { slots, mask }
+    let cap = (moved.len() * 5 / 2).max(16);
+    let mut out = Links { slots: vec![(0u64, 0u64); cap], cap };
+    for &(k, v) in &moved {
+        let mut j = out.home(mix(k));
+        while out.slots[j].0 != 0 {
+            j += 1;
+            if j == cap {
+                j = 0;
+            }
+        }
+        out.slots[j] = (k, v);
+    }
+    out
 }
 
 // ------------------------------------------------------------------ stage B
@@ -933,7 +961,7 @@ unsafe fn dedup_ck(segs: &[(Ptr<CRec>, usize)], tab: &mut Vec<u64>) {
     }
 }
 
-const LOOK: usize = 8;
+const LOOK: usize = 16;
 
 unsafe fn route_ev(segs: &[(Ptr<ERec>, usize)], links: &Links, qb: u32, out: &mut Parts<PRec>) {
     for &(ptr, len) in segs {
