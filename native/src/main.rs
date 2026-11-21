@@ -39,7 +39,9 @@ const GAP_MS: i64 = 1_800_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const CHUNK: u64 = 1 << 20;
 const DEAD: u32 = u32::MAX;
-const RG_ROWS: usize = 1 << 20;
+/// user_daily rows per row group: the rows buffered per thread before they
+/// are written (a small reused buffer, not the whole output).
+const RG_ROWS: usize = 1 << 16;
 const NONE: u32 = u32::MAX;
 const SLOW: u64 = 1 << 63;
 
@@ -1198,32 +1200,85 @@ impl CampTab {
     }
 }
 
+/// One row group of user_daily rows, buffered; `UOut::spill` writes it to
+/// the thread's file and clears it, keeping the capacity.
 #[derive(Default)]
 struct UOut {
     rows: usize,
+    total: usize,
     uid: Vec<u8>,
-    marks: Vec<usize>,
     day: Vec<i32>,
     sess: Vec<i32>,
     evc: Vec<i32>,
     rev: Vec<i64>,
     cat: Vec<u32>,
+    path: PathBuf,
+    cat_names: Vec<Vec<u8>>,
+    w: Option<pq::Writer>,
+    defs: Vec<u8>,
+    vals: Vec<u8>,
 }
 
 impl UOut {
-    /// Reserved for about `n` rows, so the columns grow without reallocating
-    /// (each doubling copies the column into fresh pages the kernel zeroes).
-    fn with_rows(n: usize) -> UOut {
+    fn new(path: PathBuf, cat_names: Vec<Vec<u8>>) -> UOut {
+        let n = RG_ROWS;
         UOut {
-            uid: Vec::with_capacity(n * 14),
-            marks: Vec::with_capacity(n / RG_ROWS + 1),
+            uid: Vec::with_capacity(n * 16),
             day: Vec::with_capacity(n),
             sess: Vec::with_capacity(n),
             evc: Vec::with_capacity(n),
             rev: Vec::with_capacity(n),
             cat: Vec::with_capacity(n),
+            path,
+            cat_names,
             ..UOut::default()
         }
+    }
+    /// Writes the buffered rows as one row group.
+    fn spill(&mut self) {
+        if self.rows == 0 {
+            return;
+        }
+        let w = self.w.get_or_insert_with(|| user_writer(&self.path));
+        self.defs.clear();
+        self.defs.resize(self.rows.div_ceil(8), 0);
+        self.vals.clear();
+        for (i, &c) in self.cat.iter().enumerate() {
+            if c != NONE {
+                self.defs[i >> 3] |= 1 << (i & 7);
+                let name = &self.cat_names[c as usize];
+                self.vals.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                self.vals.extend_from_slice(name);
+            }
+        }
+        w.row_group(
+            self.rows,
+            &[
+                pq::ColData { values: &self.uid, defs: None },
+                pq::ColData { values: pq::bytes_of(&self.day), defs: None },
+                pq::ColData { values: pq::bytes_of(&self.sess), defs: None },
+                pq::ColData { values: pq::bytes_of(&self.evc), defs: None },
+                pq::ColData { values: pq::bytes_of(&self.rev), defs: None },
+                pq::ColData { values: &self.vals, defs: Some(&self.defs) },
+            ],
+        )
+        .expect("write user_daily");
+        self.total += self.rows;
+        self.rows = 0;
+        self.uid.clear();
+        self.day.clear();
+        self.sess.clear();
+        self.evc.clear();
+        self.rev.clear();
+        self.cat.clear();
+    }
+    /// Writes what is left and closes the file (if any rows were written).
+    fn finish(&mut self) -> usize {
+        self.spill();
+        if let Some(w) = self.w.take() {
+            w.finish().expect("finish user_daily");
+        }
+        self.total
     }
 }
 
@@ -1258,9 +1313,6 @@ impl Agg {
         }
         self.touched.clear();
         let o = &mut self.out;
-        if o.rows % RG_ROWS == 0 {
-            o.marks.push(o.uid.len());
-        }
         o.rows += 1;
         o.uid.extend_from_slice(&(self.name.len() as u32).to_le_bytes());
         o.uid.extend_from_slice(&self.name);
@@ -1269,6 +1321,9 @@ impl Agg {
         o.evc.push(events);
         o.rev.push(rev);
         o.cat.push(best);
+        if o.rows == RG_ROWS {
+            o.spill();
+        }
     }
 
     /// One person: events (ts << 32 | pc) sorted, clicks sorted by (ts, click_id).
@@ -1618,7 +1673,7 @@ unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut
     }
 }
 
-fn write_user(path: &Path, o: &UOut, cat_names: &[Vec<u8>]) {
+fn user_writer(path: &Path) -> pq::Writer {
     let schema = [
         ("user_id", pq::Kind::Str),
         ("day", pq::Kind::Date),
@@ -1627,41 +1682,7 @@ fn write_user(path: &Path, o: &UOut, cat_names: &[Vec<u8>]) {
         ("revenue_cents", pq::Kind::I64),
         ("top_category", pq::Kind::OptStr),
     ];
-    let mut w = pq::Writer::create(path, &schema).expect("create user_daily file");
-    let mut defs: Vec<u8> = Vec::new();
-    let mut vals: Vec<u8> = Vec::new();
-    let mut g = 0usize;
-    while g * RG_ROWS < o.rows {
-        let a = g * RG_ROWS;
-        let b = (a + RG_ROWS).min(o.rows);
-        let ua = o.marks[g];
-        let ub = if g + 1 < o.marks.len() { o.marks[g + 1] } else { o.uid.len() };
-        defs.clear();
-        defs.resize((b - a).div_ceil(8), 0);
-        vals.clear();
-        for (i, &c) in o.cat[a..b].iter().enumerate() {
-            if c != NONE {
-                defs[i >> 3] |= 1 << (i & 7);
-                let name = &cat_names[c as usize];
-                vals.extend_from_slice(&(name.len() as u32).to_le_bytes());
-                vals.extend_from_slice(name);
-            }
-        }
-        w.row_group(
-            b - a,
-            &[
-                pq::ColData { values: &o.uid[ua..ub], defs: None },
-                pq::ColData { values: pq::bytes_of(&o.day[a..b]), defs: None },
-                pq::ColData { values: pq::bytes_of(&o.sess[a..b]), defs: None },
-                pq::ColData { values: pq::bytes_of(&o.evc[a..b]), defs: None },
-                pq::ColData { values: pq::bytes_of(&o.rev[a..b]), defs: None },
-                pq::ColData { values: &vals, defs: Some(&defs) },
-            ],
-        )
-        .expect("write user_daily");
-        g += 1;
-    }
-    w.finish().expect("finish user_daily");
+    pq::Writer::create(path, &schema).expect("create user_daily file")
 }
 
 // ------------------------------------------------------------------ main
@@ -1876,7 +1897,6 @@ fn main() {
                             }
                         }
                         let _ = links.set(build_links(&pairs));
-                        if std::env::var_os("MEMDBG").is_some() { eprintln!("mem after links {}", mem_now()); }
                     }
                     let arena = Arena::leak(slab_a);
                     let mut pe = Parts::<ERec>::new(npe, arena);
@@ -1997,8 +2017,6 @@ fn main() {
     let mut order: Vec<(usize, usize)> = (0..nq).map(|q| (qes.iter().map(|c| c.len(q)).sum::<usize>(), q)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let next = AtomicUsize::new(0);
-    // user_daily rows run about one per 9 events; a thread's share plus headroom
-    let urows = (est_ev as usize / 8 / nt) * 5 / 4 + 1024;
     let mut camp_tabs: Vec<CampTab> = Vec::new();
     let mut total_rows = 0usize;
     std::thread::scope(|sc| {
@@ -2023,7 +2041,7 @@ fn main() {
                         csum: vec![0; 256],
                         touched: Vec::new(),
                         cat_rank: cat_rank.clone(),
-                        out: UOut::with_rows(urows),
+                        out: UOut::new(ud_dir.join(format!("part-{}.parquet", t)), cat_names.clone()),
                         name: Vec::new(),
                     };
                     let mut local = Local { slots: Vec::new(), mask: 0, keys: Vec::new() };
@@ -2035,10 +2053,8 @@ fn main() {
                         }
                         unsafe { do_part(order[i].1, qes, qcs, &mut local, &mut bufs, &mut agg) };
                     }
-                    if agg.out.rows > 0 {
-                        write_user(&ud_dir.join(format!("part-{}.parquet", t)), &agg.out, cat_names);
-                    }
-                    (agg.camp, agg.out.rows)
+                    let rows = agg.out.finish();
+                    (agg.camp, rows)
                 })
             })
             .collect();
@@ -2049,7 +2065,7 @@ fn main() {
         }
     });
     if total_rows == 0 {
-        write_user(&ud_dir.join("part-0.parquet"), &UOut::default(), &cat_names);
+        user_writer(&ud_dir.join("part-0.parquet")).finish().expect("finish user_daily");
     }
     let t_d = t0.elapsed();
     let m_d = mem_now();
