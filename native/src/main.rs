@@ -1044,8 +1044,10 @@ struct CampAgg {
     assisted: i64,
 }
 
+/// Dense: rows by (day, campaign), plus the assisted counts as their own
+/// small array, so one session's assist increments hit one short run of it.
 enum CampTab {
-    Dense(Vec<CampAgg>, usize),
+    Dense(Vec<CampAgg>, Vec<u32>, usize),
     Sparse(HashMap<(u32, u32), CampAgg>),
 }
 
@@ -1053,8 +1055,24 @@ impl CampTab {
     #[inline(always)]
     fn at(&mut self, camp: u32, day: u32) -> &mut CampAgg {
         match self {
-            CampTab::Dense(v, nd) => unsafe { v.get_unchecked_mut(camp as usize * *nd + day as usize) },
+            CampTab::Dense(v, _, nc) => unsafe { v.get_unchecked_mut(day as usize * *nc + camp as usize) },
             CampTab::Sparse(m) => m.entry((camp, day)).or_default(),
+        }
+    }
+    #[inline(always)]
+    fn assist(&mut self, active: &[u32], day: u32) {
+        match self {
+            CampTab::Dense(_, a, nc) => {
+                let row = &mut a[day as usize * *nc..(day as usize + 1) * *nc];
+                for &c in active {
+                    unsafe { *row.get_unchecked_mut(c as usize) += 1 };
+                }
+            }
+            CampTab::Sparse(m) => {
+                for &c in active {
+                    m.entry((c, day)).or_default().assisted += 1;
+                }
+            }
         }
     }
 }
@@ -1200,10 +1218,7 @@ impl Agg {
                         k -= 1;
                     }
                     credit = cks[k].camp;
-                    for a in 0..self.active.len() {
-                        let c = self.active[a];
-                        self.camp.at(c, d).assisted += 1;
-                    }
+                    self.camp.assist(&self.active, d);
                 }
             }
             let r = self.camp.at(credit, d);
@@ -1780,7 +1795,7 @@ fn main() {
                         day_min,
                         organic,
                         camp: if dense {
-                            CampTab::Dense(vec![CampAgg::default(); ncamp * ndays], ndays)
+                            CampTab::Dense(vec![CampAgg::default(); ncamp * ndays], vec![0; ncamp * ndays], ncamp)
                         } else {
                             CampTab::Sparse(HashMap::new())
                         },
@@ -1825,18 +1840,18 @@ fn main() {
     if dense {
         let mut sum = vec![CampAgg::default(); ncamp * ndays];
         for t in &camp_tabs {
-            if let CampTab::Dense(v, _) = t {
-                for (s, x) in sum.iter_mut().zip(v.iter()) {
+            if let CampTab::Dense(v, a, _) = t {
+                for ((s, x), &y) in sum.iter_mut().zip(v.iter()).zip(a.iter()) {
                     s.sessions += x.sessions;
                     s.purchasing += x.purchasing;
                     s.revenue += x.revenue;
-                    s.assisted += x.assisted;
+                    s.assisted += y as i64;
                 }
             }
         }
         for (i, s) in sum.iter().enumerate() {
             if s.sessions != 0 || s.assisted != 0 {
-                merged.push((((i / ndays) as u32, (i % ndays) as u32), *s));
+                merged.push((((i % ncamp) as u32, (i / ncamp) as u32), *s));
             }
         }
     } else {
