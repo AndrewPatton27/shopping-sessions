@@ -308,10 +308,10 @@ unsafe fn scan<const NF: usize>(base: *const u8, lo: usize, hi: usize, mut row: 
             pos = next;
             continue;
         }
+        let sp = c | nlb;
+        let qs = q & ((c << 1) | 1);
+        let qe = q & (sp >> 1);
         {
-            let sp = c | nlb;
-            let qs = q & ((c << 1) | 1);
-            let qe = q & (sp >> 1);
             let ns = below & !c;
             let mapped = (ns.wrapping_add(qs) ^ ns) & sp;
             if (q & !(qs | qe)) | (qs & qe) | (mapped ^ (qe << 1)) != 0 {
@@ -319,20 +319,18 @@ unsafe fn scan<const NF: usize>(base: *const u8, lo: usize, hi: usize, mut row: 
                 continue;
             }
         }
+        // field starts (after each separator) and ends (at each separator),
+        // moved inward past a field's quotes: then field i is the i-th set
+        // bit of each mask, with no per-field shifts or quote tests
+        let mut st = (((c << 1) | 1) & !qs) | (qs << 1);
+        let mut en = (sp & !(qe << 1)) | qe;
         let mut f = [(0usize, 0usize); NF];
-        let mut a = 0u32;
-        let mut cc = c;
-        for (i, x) in f.iter_mut().enumerate() {
-            let e = if i + 1 < NF {
-                let t = cc.trailing_zeros();
-                cc &= cc - 1;
-                t
-            } else {
-                nl
-            };
-            let qb = ((q >> a) & 1) as u32;
-            *x = (pos + (a + qb) as usize, pos + (e - qb) as usize);
-            a = e + 1;
+        for x in f.iter_mut() {
+            let a = st.trailing_zeros();
+            st &= st - 1;
+            let e = en.trailing_zeros();
+            en &= en - 1;
+            *x = (pos + a as usize, pos + e as usize);
         }
         row(&f);
         pos = next;
