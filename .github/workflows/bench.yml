@@ -61,7 +61,7 @@ jobs:
           git fetch -q origin main
           git worktree add -q /tmp/base origin/main
           (cd /tmp/base/native && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q)
-          for i in 1 2 3; do DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/outbase$i NCPU=$(nproc) /tmp/base/native/target/release/shopping-sessions 2>&1 | grep -o "total [0-9]* ms"; done
+          for i in 1 2 3; do DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/outbase$i NCPU=$(nproc) /tmp/base/native/target/release/shopping-sessions 2>&1 | head -1 | sed "s/^/BASE /"; done
           pip install -q polars==2.0.0 pyarrow==25.0.1
           cd scripts && python compare.py /tmp/out1 /tmp/outbase1
       - name: Docker run (x1)
