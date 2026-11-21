@@ -1,12 +1,13 @@
 //! Shopping Sessions: native pipeline. See README.md for the design.
 //!
 //! Stages (each one parallel over NCPU threads):
-//!   A  parse. Every event row becomes one 32 B record in the partition of
-//!      hash(event_id), every valid click one 24 B record in the partition of
-//!      hash(click_id). No table lookups. Thread 0 first builds the link table.
-//!   B  per id partition: dedup in a cache-sized table, then map each survivor
-//!      to its person (link table) and write a 16 B / 24 B record to the
-//!      partition of hash(person)
+//!   A  parse. Thread 0 builds the link table while the others parse clicks;
+//!      then every valid event row is mapped to its person at once and written
+//!      once, as a 16 B record in the partition of hash(person), plus a 16 B
+//!      dedup record (event_id, ingest_ts, where the row went) in the partition
+//!      of hash(event_id). Clicks: one 32 B record per hash(click_id).
+//!   B  per id partition: dedup in a cache-sized table; a losing event copy is
+//!      marked dead in place; surviving clicks are routed to person partitions
 //!   C  per person partition: group by person, sort, sessionize, attribute,
 //!      aggregate; write Parquet (one user_daily file per thread)
 //!
@@ -471,17 +472,23 @@ fn csv_files(dir: &Path) -> Vec<(PathBuf, u64)> {
 
 // ------------------------------------------------------------------ records
 
-/// Stage A event row. ts: ms since window_start, DEAD = failed validation (or,
-/// after dedup, a losing copy). pc: price << 8 | category, 0 for view/cart.
+/// Stage A event dedup record. ing: ingest_ts in seconds from ING_BASE.
+/// loc: q << 22 | index of the row in its thread's person partition q, or INV
+/// for a copy that failed validation (it has no person row).
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct ERec {
+struct DRec {
     eid: u64,
-    user: u64,
-    ing: i64,
-    ts: u32,
-    pc: u32,
+    ing: u32,
+    loc: u32,
 }
+
+const INV: u32 = u32::MAX;
+const LOC_BITS: u32 = 22;
+const LOC_MAX: u32 = (1 << LOC_BITS) - 1;
+const DEAD_KEY: u64 = u64::MAX;
+/// Set when a dataset does not fit the compact records: rerun with legacy.
+static BAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Stage A click row. ord: read order (task << 32 | row), the first copy read
 /// wins. ts: ms since window_start - 7 days. camp: campaign index, DEAD for an
@@ -496,7 +503,7 @@ struct CRec {
     camp: u32,
 }
 
-/// Stage B event row: person, ts << 32 | pc.
+/// Person event row: person, ts << 32 | pc (DEAD_KEY: a losing copy).
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PRec {
@@ -569,6 +576,28 @@ impl<T: Copy> Parts<T> {
             }
         }
     }
+    /// push, returning the row's index within partition p.
+    #[inline(always)]
+    fn push_idx(&mut self, p: usize, v: T) -> u32 {
+        unsafe {
+            let s = *self.start.get_unchecked(p);
+            let ce = self.ce.get_unchecked_mut(p);
+            if ce.0 < ce.1 {
+                self.buf.as_mut_ptr().add(ce.0 as usize).write(v);
+                ce.0 += 1;
+                ce.0 - 1 - s
+            } else {
+                let o = self.over.get_unchecked_mut(p);
+                o.push(v);
+                ce.1 - s + o.len() as u32 - 1
+            }
+        }
+    }
+    /// (region, region capacity, overflow) of partition p, writable.
+    fn region_mut(&mut self, p: usize) -> (Ptr<T>, u32, Ptr<T>) {
+        let s = self.start[p] as usize;
+        (Ptr(unsafe { self.buf.as_mut_ptr().add(s) }), self.ce[p].1 - self.start[p], Ptr(self.over[p].as_mut_ptr()))
+    }
     fn len(&self, p: usize) -> usize {
         (self.ce[p].0 - self.start[p]) as usize + self.over[p].len()
     }
@@ -608,6 +637,8 @@ struct Cfg {
     pe_bits: u32,
     pc_bits: u32,
     q_bits: u32,
+    /// ingest_ts seconds origin of DRec.ing
+    ing_base: i64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -648,20 +679,58 @@ unsafe fn rd32(p: *const u8) -> u32 {
     std::ptr::read_unaligned(p as *const u32)
 }
 
-unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
-    let (ws, we) = (cfg.ws, cfg.we);
+/// A valid event row waiting for its user's link-table slot to arrive.
+#[derive(Clone, Copy, Default)]
+struct PendE {
+    u: u64,
+    h: u64,
+    eid: u64,
+    key: u64,
+    ing: u32,
+}
 
+const RING: usize = 16;
+
+struct EvOut {
+    pe: Parts<PRec>,
+    pd: Parts<DRec>,
+}
+
+#[inline(always)]
+fn emit_e(cfg: &Cfg, links: &Links, p: &PendE, out: &mut EvOut) {
+    let person = links.lookup(p.u, p.h);
+    let hp = if person == p.u { p.h } else { mix(person) };
+    let q = part_of(hp, cfg.q_bits);
+    let idx = out.pe.push_idx(q, PRec { person, key: p.key });
+    if idx >= LOC_MAX {
+        BAIL.store(true, AO::Relaxed);
+    }
+    let loc = ((q as u32) << LOC_BITS) | idx.min(LOC_MAX - 1);
+    out.pd.push(part_of(mix(p.eid), cfg.pe_bits), DRec { eid: p.eid, ing: p.ing, loc });
+}
+
+unsafe fn parse_events(cfg: &Cfg, links: &Links, base: *const u8, lo: usize, hi: usize, out: &mut EvOut) {
+    let (ws, we) = (cfg.ws, cfg.we);
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
+    let ing_base = cfg.ing_base;
+    let mut ring = [PendE::default(); RING];
+    let mut k = 0usize;
     scan::<7>(base, lo, hi, |f| {
         let (a, b) = f[0];
         if a == b {
             return;
         }
         let eid = key_of(base.add(a), b - a);
-        let ing = cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX);
-        let mut r = ERec { eid, user: 0, ing, ts: DEAD, pc: 0 };
+        let (ia, ib) = f[3];
+        let ing_ms = cfg.cal.f1_trusted(base.add(ia), ib - ia).unwrap_or(i64::MAX);
+        // whole seconds near the window, else the compact record cannot hold it
+        let rel = (ing_ms / 1000).wrapping_sub(ing_base);
+        if ib - ia != 20 || rel as u64 > u32::MAX as u64 {
+            BAIL.store(true, AO::Relaxed);
+        }
+        let ing = rel as u32;
         'v: {
             let (ua, ub) = f[1];
             let (pa, pb) = f[5];
@@ -679,22 +748,34 @@ unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &m
                 Some(t) if t >= ws && t < we => t,
                 _ => break 'v,
             };
-            if ing.saturating_sub(ts) > DAY_MS {
+            if ing_ms.saturating_sub(ts) > DAY_MS {
                 break 'v;
             }
+            let mut pc = 0u32;
             if purchase {
                 let price = match parse_price(std::slice::from_raw_parts(base.add(f[6].0), f[6].1 - f[6].0)) {
                     Some(p) => p,
                     None => break 'v,
                 };
                 let cat = key_find(base.add(pa), pb - pa).and_then(|k| cfg.products.get(k)).unwrap_or(cfg.unknown_cat);
-                r.pc = (price << 8) | cat;
+                pc = (price << 8) | cat;
             }
-            r.user = key_of(base.add(ua), ub - ua);
-            r.ts = (ts - ws) as u32;
+            let u = key_of(base.add(ua), ub - ua);
+            let h = mix(u);
+            links.prefetch(h);
+            let s = k & (RING - 1);
+            if k >= RING {
+                emit_e(cfg, links, &ring[s], out);
+            }
+            ring[s] = PendE { u, h, eid, key: (((ts - ws) as u64) << 32) | pc as u64, ing };
+            k += 1;
+            return;
         }
-        out.push(part_of(mix(eid), cfg.pe_bits), r);
+        out.pd.push(part_of(mix(eid), cfg.pe_bits), DRec { eid, ing, loc: INV });
     });
+    for j in k.saturating_sub(RING)..k {
+        emit_e(cfg, links, &ring[j & (RING - 1)], out);
+    }
 }
 
 /// Invalid clicks are kept (camp DEAD): dedup comes before validation.
@@ -888,8 +969,22 @@ fn table(tab: &mut Vec<u64>, n: usize) -> usize {
     cap - 1
 }
 
-/// Marks every copy but the one with the smallest ingest_ts DEAD.
-unsafe fn dedup_ev(segs: &[(Ptr<ERec>, usize)], tab: &mut Vec<u64>) {
+/// Person row regions of one thread: per partition (region, capacity, overflow).
+type Regions = Vec<(Ptr<PRec>, u32, Ptr<PRec>)>;
+
+#[inline(always)]
+unsafe fn kill_ev(regs: &[Regions], t: usize, loc: u32) {
+    if loc != INV {
+        let (r, cap, o) = *regs.get_unchecked(t).get_unchecked((loc >> LOC_BITS) as usize);
+        let i = loc & LOC_MAX;
+        let p = if i < cap { r.0.add(i as usize) } else { o.0.add((i - cap) as usize) };
+        (*p).key = DEAD_KEY;
+    }
+}
+
+/// Keeps the copy with the smallest ingest_ts of every event_id: the person
+/// rows of the others are marked dead. segs: (rows, len, thread).
+unsafe fn dedup_ev(segs: &[(Ptr<DRec>, usize, usize)], regs: &[Regions], tab: &mut Vec<u64>) {
     let n: usize = segs.iter().map(|s| s.1).sum();
     if n < 2 {
         return;
@@ -897,12 +992,11 @@ unsafe fn dedup_ev(segs: &[(Ptr<ERec>, usize)], tab: &mut Vec<u64>) {
     assert!(segs.len() <= 4096);
     let mask = table(tab, n);
     let t = tab.as_mut_ptr();
-    for (si, &(ptr, len)) in segs.iter().enumerate() {
+    for (si, &(ptr, len, th)) in segs.iter().enumerate() {
         assert!(len < (1 << 28));
         for i in 0..len {
-            let r = ptr.0.add(i);
-            let eid = (*r).eid;
-            let h = mix(eid);
+            let r = *ptr.0.add(i);
+            let h = mix(r.eid);
             let tag = ((h >> 24) & 0xFF_FFFF) | 1;
             let new = (tag << 40) | ((si as u64) << 28) | i as u64;
             let mut j = h as usize & mask;
@@ -913,13 +1007,14 @@ unsafe fn dedup_ev(segs: &[(Ptr<ERec>, usize)], tab: &mut Vec<u64>) {
                     break;
                 }
                 if s >> 40 == tag {
-                    let o = segs.get_unchecked(((s >> 28) & 0xFFF) as usize).0 .0.add((s & 0x0FFF_FFFF) as usize);
-                    if (*o).eid == eid {
-                        if (*r).ing < (*o).ing {
-                            (*o).ts = DEAD;
+                    let os = segs.get_unchecked(((s >> 28) & 0xFFF) as usize);
+                    let o = *os.0 .0.add((s & 0x0FFF_FFFF) as usize);
+                    if o.eid == r.eid {
+                        if r.ing < o.ing {
+                            kill_ev(regs, os.2, o.loc);
                             *t.add(j) = new;
                         } else {
-                            (*r).ts = DEAD;
+                            kill_ev(regs, th, r.loc);
                         }
                         break;
                     }
@@ -974,24 +1069,6 @@ unsafe fn dedup_ck(segs: &[(Ptr<CRec>, usize)], tab: &mut Vec<u64>) {
 
 const LOOK: usize = 16;
 
-unsafe fn route_ev(segs: &[(Ptr<ERec>, usize)], links: &Links, qb: u32, out: &mut Parts<PRec>) {
-    for &(ptr, len) in segs {
-        let p = ptr.0;
-        for i in 0..len {
-            if i + LOOK < len {
-                links.prefetch(mix((*p.add(i + LOOK)).user));
-            }
-            let r = *p.add(i);
-            if r.ts == DEAD {
-                continue;
-            }
-            let hu = mix(r.user);
-            let person = links.lookup(r.user, hu);
-            let hp = if person == r.user { hu } else { mix(person) };
-            out.push(part_of(hp, qb), PRec { person, key: ((r.ts as u64) << 32) | r.pc as u64 });
-        }
-    }
-}
 
 unsafe fn route_ck(segs: &[(Ptr<CRec>, usize)], links: &Links, qb: u32, out: &mut Parts<PCk>) {
     for &(ptr, len) in segs {
@@ -1295,6 +1372,9 @@ unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut
     b.off.clear();
     for &(ptr, len) in &b.segs {
         for e in std::slice::from_raw_parts(ptr.0, len) {
+            if e.key == DEAD_KEY {
+                continue;
+            }
             let id = local.get_or_insert(e.person);
             if id as usize == b.off.len() {
                 b.off.push(0);
@@ -1317,6 +1397,9 @@ unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut
     let mut k = 0usize;
     for &(ptr, len) in &b.segs {
         for e in std::slice::from_raw_parts(ptr.0, len) {
+            if e.key == DEAD_KEY {
+                continue;
+            }
             let id = *b.ids.get_unchecked(k) as usize;
             k += 1;
             let pos = b.off.get_unchecked_mut(id);
@@ -1591,7 +1674,8 @@ fn main() {
         campaigns,
         pe_bits: bits_for(est_ev, 32768),
         pc_bits: bits_for(est_ck, 32768),
-        q_bits: bits_for(est_ev, 65536),
+        q_bits: bits_for(est_ev, 65536).min(32 - LOC_BITS),
+        ing_base: ws.div_euclid(1000) - (1i64 << 31),
     };
     let (npe, npc, nq) = (1usize << cfg.pe_bits, 1usize << cfg.pc_bits, 1usize << cfg.q_bits);
 
@@ -1604,19 +1688,21 @@ fn main() {
         }
     };
     let mut tasks: Vec<Task> = Vec::new();
-    chunks(&ev_files, Kind::Events, &mut tasks);
+    // clicks first: they need no link table, which thread 0 is building
     chunks(&ck_files, Kind::Clicks, &mut tasks);
+    chunks(&ev_files, Kind::Events, &mut tasks);
     let mut ltasks: Vec<Task> = Vec::new();
     chunks(&ln_files, Kind::Events, &mut ltasks);
     let t_setup = t0.elapsed();
 
-    // ---- stage A: parse into id partitions; thread 0 first builds the links
+    // ---- stage A: parse; thread 0 first builds the links, events wait for them
     let links: OnceLock<Links> = OnceLock::new();
     let next = AtomicUsize::new(0);
     // a thread's share of rows, with headroom; overflow spills
     let share = |est: u64, np: usize| (est as usize / nt) * 6 / 5 / np + 16;
-    let (per_e, per_c) = (share(est_ev, npe), share(est_ck, npc));
-    let mut pes: Vec<Parts<ERec>> = Vec::with_capacity(nt);
+    let (per_e, per_d, per_c) = (share(est_ev, nq), share(est_ev, npe), share(est_ck, npc));
+    let mut pes: Vec<Parts<PRec>> = Vec::with_capacity(nt);
+    let mut pds: Vec<Parts<DRec>> = Vec::with_capacity(nt);
     let mut pcs: Vec<Parts<CRec>> = Vec::with_capacity(nt);
     std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nt)
@@ -1637,7 +1723,7 @@ fn main() {
                         }
                         let _ = links.set(build_links(&pairs));
                     }
-                    let mut pe = Parts::<ERec>::new(npe, per_e);
+                    let mut eo = EvOut { pe: Parts::<PRec>::new(nq, per_e), pd: Parts::<DRec>::new(npe, per_d) };
                     let mut pc = Parts::<CRec>::new(npc, per_c);
                     loop {
                         let i = next.fetch_add(1, AO::Relaxed);
@@ -1657,41 +1743,49 @@ fn main() {
                         let base = buf.as_ptr();
                         unsafe {
                             match tk.kind {
-                                Kind::Events => parse_events(cfg, base, lo, hi, &mut pe),
+                                Kind::Events => parse_events(cfg, links.wait(), base, lo, hi, &mut eo),
                                 Kind::Clicks => parse_clicks(cfg, base, lo, hi, i as u64, &mut pc),
                             }
                         }
                     }
-                    (pe, pc)
+                    (eo, pc)
                 })
             })
             .collect();
         for h in hs {
-            let (pe, pc) = h.join().expect("parse thread");
-            pes.push(pe);
+            let (eo, pc) = h.join().expect("parse thread");
+            pes.push(eo.pe);
+            pds.push(eo.pd);
             pcs.push(pc);
         }
     });
     let links = links.into_inner().expect("links");
+    if BAIL.load(AO::Relaxed) {
+        legacy::run();
+    }
     let t_a = t0.elapsed();
 
-    // ---- stage B: dedup per id partition, route survivors to person partitions
-    let mut qes: Vec<Parts<PRec>> = Vec::with_capacity(nt);
+    // ---- stage B: dedup per id partition (events: mark losers dead in place;
+    // clicks: route survivors to person partitions)
     let mut qcs: Vec<Parts<PCk>> = Vec::with_capacity(nt);
     {
-        let (per_qe, per_qc) = (share(est_ev, nq), share(est_ck, nq));
+        let per_qc = share(est_ck, nq);
         let mut border: Vec<(usize, usize)> = (0..npe)
-            .map(|p| (pes.iter().map(|x| x.len(p)).sum::<usize>(), p))
-            .chain((0..npc).map(|p| (pcs.iter().map(|x| x.len(p)).sum::<usize>() / 2, npe + p)))
+            .map(|p| (pds.iter().map(|x| x.len(p)).sum::<usize>() / 2, p))
+            .chain((0..npc).map(|p| (pcs.iter().map(|x| x.len(p)).sum::<usize>(), npe + p)))
             .collect();
         border.sort_unstable_by(|a, b| b.cmp(a));
-        let mut esegs: Vec<Vec<(Ptr<ERec>, usize)>> = vec![Vec::new(); npe];
-        let mut csegs: Vec<Vec<(Ptr<CRec>, usize)>> = vec![Vec::new(); npc];
-        for x in pes.iter_mut() {
-            for (p, v) in esegs.iter_mut().enumerate() {
-                x.segs_mut(p, v);
+        let mut dsegs: Vec<Vec<(Ptr<DRec>, usize, usize)>> = vec![Vec::new(); npe];
+        let mut tmp: Vec<(Ptr<DRec>, usize)> = Vec::new();
+        for (t, x) in pds.iter_mut().enumerate() {
+            for (p, v) in dsegs.iter_mut().enumerate() {
+                tmp.clear();
+                x.segs_mut(p, &mut tmp);
+                v.extend(tmp.iter().map(|&(a, n)| (a, n, t)));
             }
         }
+        let regs: Vec<Regions> = pes.iter_mut().map(|x| (0..nq).map(|q| x.region_mut(q)).collect()).collect();
+        let mut csegs: Vec<Vec<(Ptr<CRec>, usize)>> = vec![Vec::new(); npc];
         for x in pcs.iter_mut() {
             for (p, v) in csegs.iter_mut().enumerate() {
                 x.segs_mut(p, v);
@@ -1702,9 +1796,8 @@ fn main() {
         std::thread::scope(|sc| {
             let hs: Vec<_> = (0..nt)
                 .map(|_| {
-                    let (esegs, csegs, next, links, border) = (&esegs, &csegs, &next, &links, &border);
+                    let (dsegs, regs, csegs, next, links, border) = (&dsegs, &regs, &csegs, &next, &links, &border);
                     sc.spawn(move || {
-                        let mut oe = Parts::<PRec>::new(nq, per_qe);
                         let mut oc = Parts::<PCk>::new(nq, per_qc);
                         let mut tab: Vec<u64> = Vec::new();
                         loop {
@@ -1713,28 +1806,27 @@ fn main() {
                                 break;
                             }
                             let p = border[i].1;
-                            // SAFETY: partition p's rows are touched by this task only.
+                            // SAFETY: partition p's dedup rows, and the person rows they
+                            // point at, are touched by this task only.
                             unsafe {
                                 if p < npe {
-                                    dedup_ev(&esegs[p], &mut tab);
-                                    route_ev(&esegs[p], links, qb, &mut oe);
+                                    dedup_ev(&dsegs[p], regs, &mut tab);
                                 } else {
                                     dedup_ck(&csegs[p - npe], &mut tab);
                                     route_ck(&csegs[p - npe], links, qb, &mut oc);
                                 }
                             }
                         }
-                        (oe, oc)
+                        oc
                     })
                 })
                 .collect();
             for h in hs {
-                let (oe, oc) = h.join().expect("dedup thread");
-                qes.push(oe);
-                qcs.push(oc);
+                qcs.push(h.join().expect("dedup thread"));
             }
         });
     }
+    let qes = pes;
     let t_b = t0.elapsed();
 
     // ---- stage C: sessionize per person partition, then write user_daily
