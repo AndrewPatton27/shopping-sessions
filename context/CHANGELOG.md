@@ -56,3 +56,6 @@
 - 2026-11-21: exp-br merged (KeyMap 4-key branch-free buckets, pack7 unconditional 9th byte, push_if route, 8-key link buckets). CI neutral; submitting to test on scorer Xeon. Lead: META + fuzz 601-800 PASS; agent 60M MATCH.
 - 2026-11-21: BB-84907B35 (exp-br) 0.92 s vs best 0.88: branch-removal theory not supported; reverted exp-br on main. 0.88 gain likely from memory traffic (NT stores, 1-line probes). Rule update: repo may go private after a submission is scored (they keep copies).
 - 2026-11-21: exp-mem merged (high-water read buffer, grow-only stage-C scratch, user_daily columns reserved, 16 B credited rows). CI 20M -2.3%. Lead: META + fuzz 801-1000 PASS; agent 60M MATCH.
+- 2026-11-21: BB-18B5A4F2 (exp-mem) 0.87 s, official rank 69/290 (board prints ranks; ties marked TIE; earlier self-computed ranks undercounted ties).
+- 2026-11-21: exp-rec (peer session, 24 B ERec/CRec): verify + dev MATCH (worktree wt-rec); CI same-run 20M median 1181 vs main 1164 ms (neutral/slightly worse). Parked as scorer candidate.
+- 2026-11-21: exp-mem2 merged (chunked arenas via Parts with stage-B chunk reuse; scan field bounds from quote-adjusted masks). CI -2.5%, peak RSS 1.97 -> 1.16 GB. Lead: META + dev + fuzz 1001-1200 PASS; agent 60M MATCH.
