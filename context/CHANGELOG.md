@@ -26,3 +26,7 @@
 - 2026-11-21: Sonnet round 2 verified by lead (VERIFY PASS full: oracle, 36/36, regress 4/4, dev MATCH 2.1 s, seeds MATCH, invariants). 10M 25.9 s -> 9.5 s, peak RSS 6.5 -> 2.8 GB. Committed. Agent defs installed (.claude/agents, project root, not in repo).
 - 2026-11-21: Native Rust (Fable, std-only) verified by lead: full verify + META PASS (default and x86-64-v3 builds), dev 0.1 s, 10M 0.9-1.0 s vs Polars 7.8 s, 10M output MATCH Polars. Linux target cargo check OK. Dockerfile switched to Rust multi-stage; Polars kept as Dockerfile.polars. Image unbuilt (no Docker).
 - 2026-11-21: Rust perf: person partition q_bits min 262144 (was 32768): 10M ~490->425 ms quiet, 20M ~1775->1520 ms. Lead verify PASS. Committed.
+- 2026-11-21: Rust at official-generator 60M: 8.4 s wall, peak 8.9 GB (laptop, cold cache), INV check on output; 20M peak 2.97 GB.
+- 2026-11-21: 60M cross-check: Rust output MATCH Polars (6,580,803 user_daily, 28,014 campaign_daily rows). Polars 85 s vs Rust 8.4 s.
+- 2026-11-21: Opus native review: no confirmed rule bugs or default-run UB; 200-seed fuzz 0 mismatches; Parquet readable by pyarrow/duckdb/polars/pandas. Follow-ups to Haiku: read_range zero-fill, bits_for div0 guard, fuzz.py + FUZZ=1 in verify.
+- 2026-11-21: Rust safety: read_range zero-fill (no set_len UB), bits_for div0 guard. Interleaved 10M timing old vs new: no measurable change. Committed.

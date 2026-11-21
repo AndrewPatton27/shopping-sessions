@@ -357,10 +357,7 @@ fn read_range(f: &mut File, from: u64, to: u64, buf: &mut Vec<u8>) {
     let old = buf.len();
     buf.reserve(n + 128);
     f.seek(SeekFrom::Start(from)).expect("seek");
-    unsafe {
-        // SAFETY: read_exact fully initializes the new tail or panics.
-        buf.set_len(old + n);
-    }
+    buf.resize(old + n, 0);
     f.read_exact(&mut buf[old..]).expect("read");
 }
 
@@ -1264,6 +1261,7 @@ fn clean_dir(dir: &Path) {
 }
 
 fn bits_for(rows: u64, per: u64) -> u32 {
+    let per = per.max(1);
     let parts = ((rows / per).max(1)).next_power_of_two().min(4096);
     parts.trailing_zeros()
 }
