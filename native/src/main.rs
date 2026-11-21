@@ -113,6 +113,56 @@ unsafe fn pack7(p: *const u8, len: usize) -> Option<u64> {
     Some((x << 7) | b8)
 }
 
+/// pack7 of 16 IDs at once: ID i is the n[i] bytes at base + a[i]. Lanes
+/// pack7 rejects are set in the returned mask (their out value is garbage).
+/// Requires 16 readable bytes at each ID start.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vbmi2,avx2")]
+#[inline]
+unsafe fn pack16(base: *const u8, a: &[u32; 16], n: &[u32; 16], out: &mut [u64; 16]) -> u16 {
+    use std::arch::x86_64::*;
+    let av = _mm512_loadu_si512(a.as_ptr() as *const _);
+    let nv = _mm512_loadu_si512(n.as_ptr() as *const _);
+    // 1..=9 bytes
+    let mut slow = !_mm512_cmplt_epu32_mask(_mm512_sub_epi32(nv, _mm512_set1_epi32(1)), _mm512_set1_epi32(9));
+    // byte 8 of each ID, 0 unless it has 9 bytes
+    let b8w = _mm512_i32gather_epi32::<1>(_mm512_add_epi32(av, _mm512_set1_epi32(8)), base as *const i32);
+    let n9 = _mm512_cmpeq_epi32_mask(nv, _mm512_set1_epi32(9));
+    let b8w = _mm512_maskz_and_epi32(n9, b8w, _mm512_set1_epi32(0xFF));
+    slow |= n9 & _mm512_cmpeq_epi32_mask(b8w, _mm512_setzero_si512());
+    let bswap = _mm512_set_epi64(
+        0x08090A0B0C0D0E0F, 0x0001020304050607, 0x08090A0B0C0D0E0F, 0x0001020304050607,
+        0x08090A0B0C0D0E0F, 0x0001020304050607, 0x08090A0B0C0D0E0F, 0x0001020304050607,
+    );
+    let s64 = |v: u64| _mm512_set1_epi64(v as i64);
+    let mut bad16: u16 = 0;
+    for half in 0..2 {
+        let (ai, ni, bi) = if half == 0 {
+            (_mm512_castsi512_si256(av), _mm512_castsi512_si256(nv), _mm512_castsi512_si256(b8w))
+        } else {
+            (_mm512_extracti64x4_epi64::<1>(av), _mm512_extracti64x4_epi64::<1>(nv), _mm512_extracti64x4_epi64::<1>(b8w))
+        };
+        let raw = _mm512_i32gather_epi64::<1>(ai, base as *const i64);
+        let v = _mm512_shuffle_epi8(raw, bswap);
+        let len = _mm512_min_epu64(_mm512_cvtepu32_epi64(ni), s64(8));
+        let b8 = _mm512_cvtepu32_epi64(bi);
+        // m = !0 << (64 - 8 * len) (0 for len 0)
+        let m = _mm512_sllv_epi64(s64(!0), _mm512_sub_epi64(s64(64), _mm512_slli_epi64::<3>(len)));
+        let v = _mm512_and_si512(v, m);
+        let t = _mm512_or_si512(v, _mm512_andnot_si512(m, s64(0x0101_0101_0101_0101)));
+        let zero = _mm512_andnot_si512(t, _mm512_sub_epi64(t, s64(0x0101_0101_0101_0101)));
+        let hib = _mm512_or_si512(_mm512_or_si512(v, b8), zero);
+        let bad = _mm512_test_epi64_mask(hib, s64(0x8080_8080_8080_8080));
+        bad16 |= (bad as u16) << (8 * half);
+        let x = _mm512_or_si512(_mm512_srli_epi64::<1>(_mm512_and_si512(v, s64(0x7F00_7F00_7F00_7F00))), _mm512_and_si512(v, s64(0x007F_007F_007F_007F)));
+        let x = _mm512_or_si512(_mm512_srli_epi64::<2>(_mm512_and_si512(x, s64(0x3FFF_0000_3FFF_0000))), _mm512_and_si512(x, s64(0x0000_3FFF_0000_3FFF)));
+        let x = _mm512_or_si512(_mm512_srli_epi64::<4>(_mm512_and_si512(x, s64(0x0FFF_FFFF_0000_0000))), _mm512_and_si512(x, s64(0x0000_0000_0FFF_FFFF)));
+        let k = _mm512_or_si512(_mm512_slli_epi64::<7>(x), b8);
+        _mm512_storeu_si512(out.as_mut_ptr().add(8 * half) as *mut _, k);
+    }
+    slow | bad16
+}
+
 /// Exact key of a non-empty ID (interns other IDs).
 #[inline(always)]
 unsafe fn key_of(p: *const u8, len: usize) -> u64 {
@@ -844,7 +894,7 @@ unsafe fn parse_events_w<const W: bool>(cfg: &Cfg, base: *const u8, lo: usize, h
     if W {
         // AVX-512: rows collect 16 at a time; their ts and ingest_ts columns
         // are parsed 16 lanes at once, then each row is finished on its own
-        let mut bt = Batch16 { f: [[(0, 0); 7]; 16], ta: [0; 16], tn: [0; 16], ia: [0; 16], inn: [0; 16], cnt: 0 };
+        let mut bt = Batch16 { f: [[(0, 0); 7]; 16], ta: [0; 16], tn: [0; 16], ia: [0; 16], inn: [0; 16], ea: [0; 16], en: [0; 16], ua: [0; 16], un: [0; 16], cnt: 0 };
         scan_w::<7, W>(base, lo, hi, |f| {
             if f[0].0 == f[0].1 {
                 return;
@@ -855,6 +905,10 @@ unsafe fn parse_events_w<const W: bool>(cfg: &Cfg, base: *const u8, lo: usize, h
             *bt.tn.get_unchecked_mut(i) = (f[2].1 - f[2].0) as u32;
             *bt.ia.get_unchecked_mut(i) = f[3].0 as u32;
             *bt.inn.get_unchecked_mut(i) = (f[3].1 - f[3].0) as u32;
+            *bt.ea.get_unchecked_mut(i) = f[0].0 as u32;
+            *bt.en.get_unchecked_mut(i) = (f[0].1 - f[0].0) as u32;
+            *bt.ua.get_unchecked_mut(i) = f[1].0 as u32;
+            *bt.un.get_unchecked_mut(i) = (f[1].1 - f[1].0) as u32;
             bt.cnt = i + 1;
             if i == 15 {
                 bt.run(cfg, base, out);
@@ -870,18 +924,32 @@ unsafe fn parse_events_w<const W: bool>(cfg: &Cfg, base: *const u8, lo: usize, h
             return;
         }
         let ing = cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX);
-        event_row(cfg, base, f, ing, || cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0), out);
+        event_row(
+            cfg,
+            base,
+            f,
+            key_of(base.add(f[0].0), f[0].1 - f[0].0),
+            ing,
+            || cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0),
+            || key_of(base.add(f[1].0), f[1].1 - f[1].0),
+            out,
+        );
     });
 }
 
-/// Up to 16 event rows (non-empty event_id) waiting for the 16-lane
-/// timestamp parse: their fields, and the ts / ingest_ts starts and lengths.
+/// Up to 16 event rows (non-empty event_id) waiting for the 16-lane parse:
+/// their fields, and the starts and lengths of ts, ingest_ts, event_id and
+/// user_id.
 struct Batch16 {
     f: [[(usize, usize); 7]; 16],
     ta: [u32; 16],
     tn: [u32; 16],
     ia: [u32; 16],
     inn: [u32; 16],
+    ea: [u32; 16],
+    en: [u32; 16],
+    ua: [u32; 16],
+    un: [u32; 16],
     cnt: usize,
 }
 
@@ -896,17 +964,28 @@ impl Batch16 {
             self.tn[i] = self.tn[0];
             self.ia[i] = self.ia[0];
             self.inn[i] = self.inn[0];
+            self.ea[i] = self.ea[0];
+            self.en[i] = self.en[0];
+            self.ua[i] = self.ua[0];
+            self.un[i] = self.un[0];
         }
         let mut tv = [0i64; 16];
         let mut iv = [0i64; 16];
-        let (ts_slow, ing_slow) = {
+        let mut ev = [0u64; 16];
+        let mut uv = [0u64; 16];
+        let (ts_slow, ing_slow, e_slow, u_slow) = {
             #[cfg(target_arch = "x86_64")]
             {
-                (cfg.cal.parse16(base, &self.ta, &self.tn, false, &mut tv), cfg.cal.parse16(base, &self.ia, &self.inn, true, &mut iv))
+                (
+                    cfg.cal.parse16(base, &self.ta, &self.tn, false, &mut tv),
+                    cfg.cal.parse16(base, &self.ia, &self.inn, true, &mut iv),
+                    pack16(base, &self.ea, &self.en, &mut ev),
+                    pack16(base, &self.ua, &self.un, &mut uv),
+                )
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
-                (u16::MAX, u16::MAX)
+                (u16::MAX, u16::MAX, u16::MAX, u16::MAX)
             }
         };
         for i in 0..n {
@@ -918,28 +997,50 @@ impl Batch16 {
             };
             let slow = (ts_slow >> i) & 1 != 0;
             let t = tv[i];
+            let eid = if (e_slow >> i) & 1 != 0 { key_of(base.add(f[0].0), f[0].1 - f[0].0) } else { ev[i] };
+            let (us, u) = ((u_slow >> i) & 1 != 0, uv[i]);
+            {
+                let pe = pack7(base.add(f[0].0), f[0].1 - f[0].0);
+                let pu = pack7(base.add(f[1].0), f[1].1 - f[1].0);
+                let ge = if (e_slow >> i) & 1 != 0 { None } else { Some(ev[i]) };
+                let gu = if us { None } else { Some(u) };
+                if pe != ge || pu != gu {
+                    panic!("XCHECK keys {:?} {:?} {:?} {:?} {:?} {:?}", String::from_utf8_lossy(std::slice::from_raw_parts(base.add(f[0].0), f[0].1 - f[0].0)), pe, ge, String::from_utf8_lossy(std::slice::from_raw_parts(base.add(f[1].0), f[1].1 - f[1].0)), pu, gu);
+                }
+            }
             event_row(
                 cfg,
                 base,
                 f,
+                eid,
                 ing,
                 || if slow { cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0) } else if t == i64::MIN { None } else { Some(t) },
+                || if us { key_of(base.add(f[1].0), f[1].1 - f[1].0) } else { u },
                 out,
             );
         }
     }
 }
 
-/// One event row with a non-empty event_id, given its ingest time and its
-/// ts parser (called only once the cheaper checks pass).
+/// One event row with a non-empty event_id, given its key and ingest time,
+/// its ts parser (called only once the cheaper checks pass) and its user key
+/// (called only for a valid row).
 #[inline(always)]
-unsafe fn event_row(cfg: &Cfg, base: *const u8, f: &[(usize, usize); 7], ing: i64, ts: impl FnOnce() -> Option<i64>, out: &mut Parts<ERec>) {
+#[allow(clippy::too_many_arguments)]
+unsafe fn event_row(
+    cfg: &Cfg,
+    base: *const u8,
+    f: &[(usize, usize); 7],
+    eid: u64,
+    ing: i64,
+    ts: impl FnOnce() -> Option<i64>,
+    user: impl FnOnce() -> u64,
+    out: &mut Parts<ERec>,
+) {
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     let (ws, we) = (cfg.ws, cfg.we);
-    let (a, b) = f[0];
-    let eid = key_of(base.add(a), b - a);
     let mut r = ERec { eid, user: 0, ing, ts: DEAD, pc: 0 };
     'v: {
         let (ua, ub) = f[1];
@@ -969,7 +1070,7 @@ unsafe fn event_row(cfg: &Cfg, base: *const u8, f: &[(usize, usize); 7], ing: i6
             let cat = key_find(base.add(pa), pb - pa).and_then(|k| cfg.products.get(k)).unwrap_or(cfg.unknown_cat);
             r.pc = (price << 8) | cat;
         }
-        r.user = key_of(base.add(ua), ub - ua);
+        r.user = user();
         r.ts = (ts - ws) as u32;
     }
     out.push(part_of(mix(eid), cfg.pe_bits), r);
