@@ -4,3 +4,4 @@ ts	id	commit	engine	result	note
 2026-11-21T14:42Z	BB-0FF05D8C	e5e2679	rust	1.42 s	cold-disk probe (fadvise prefetch): no gain -> scorer not cold-disk bound
 2026-11-21T15:49Z	BB-0FCE2247	3050cd8	rust	1.00 s (rank 73/273)	exp-fresh redesign; scorer -30% vs CI -25%
 2026-11-21T17:09Z	BB-6695D6F9	e8ebf0e	rust	0.88 s (rank 60/282)	exp-bc; scorer -12% vs CI -3.3% (Xeon likes branch-free probe)
+2026-11-21T18:10Z	BB-84907B35	914e763	rust	0.92 s (best stays 0.88)	exp-br branch removals: no gain on scorer -> reverted
