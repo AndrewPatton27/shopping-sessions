@@ -1054,19 +1054,6 @@ impl Batch8 {
             let t = self.tv[i];
             let eid = if (e_slow >> i) & 1 != 0 { key_of(base.add(f[0].0), f[0].1 - f[0].0) } else { self.ev[i] };
             let (us, u) = ((u_slow >> i) & 1 != 0, self.uv[i]);
-            {
-                let want = cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0);
-                let got = if slow { want } else if t == i64::MIN { None } else { Some(t) };
-                let wi = cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0);
-                let gi = if (ing_slow >> i) & 1 != 0 { wi } else { Some(self.iv[i]) };
-                let pe = pack7(base.add(f[0].0), f[0].1 - f[0].0);
-                let pu = pack7(base.add(f[1].0), f[1].1 - f[1].0);
-                let ge = if (e_slow >> i) & 1 != 0 { None } else { Some(self.ev[i]) };
-                let gu = if us { None } else { Some(u) };
-                if want != got || wi != gi || pe != ge || pu != gu {
-                    panic!("XCHECK row {:?}: {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}", String::from_utf8_lossy(std::slice::from_raw_parts(base.add(f[0].0), f[6].1 - f[0].0)), want, got, wi, gi, pe, ge, pu, gu);
-                }
-            }
             event_row(
                 cfg,
                 base,
