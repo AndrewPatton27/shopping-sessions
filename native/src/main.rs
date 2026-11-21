@@ -285,7 +285,25 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
 /// with a quote ends with one: adding qs to the non-separator mask carries
 /// each start quote to its field's separator, which must equal qe << 1.
 #[inline(always)]
-unsafe fn scan<const NF: usize>(base: *const u8, lo: usize, hi: usize, mut row: impl FnMut(&[(usize, usize); NF])) {
+unsafe fn scan<const NF: usize>(base: *const u8, lo: usize, hi: usize, row: impl FnMut(&[(usize, usize); NF])) {
+    scan_w::<NF, false>(base, lo, hi, row)
+}
+
+/// Byte offsets 0..64, for the AVX-512 field split.
+static IOTA: [u8; 64] = {
+    let mut a = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        a[i] = i as u8;
+        i += 1;
+    }
+    a
+};
+
+/// scan; W: split fields with AVX-512 VBMI2 compress (callers must check the
+/// CPU and run inside a function that enables avx512f/bw/vbmi2).
+#[inline(always)]
+unsafe fn scan_w<const NF: usize, const W: bool>(base: *const u8, lo: usize, hi: usize, mut row: impl FnMut(&[(usize, usize); NF])) {
     let mut pos = lo;
     while pos < hi {
         let p = base.add(pos);
@@ -327,6 +345,30 @@ unsafe fn scan<const NF: usize>(base: *const u8, lo: usize, hi: usize, mut row: 
         let mut st = (((c << 1) | 1) & !qs) | (qs << 1);
         let mut en = (sp & !(qe << 1)) | qe;
         let mut f = [(0usize, 0usize); NF];
+        #[cfg(target_arch = "x86_64")]
+        if W {
+            // offsets of the set bits of st / en, in order, by compressing the
+            // byte offsets of each 64-bit half (the high half lands after the
+            // low half's count)
+            use std::arch::x86_64::*;
+            let mut sb = [0u8; 128];
+            let mut eb = [0u8; 128];
+            let il = _mm512_loadu_si512(IOTA.as_ptr() as *const _);
+            let ih = _mm512_add_epi8(il, _mm512_set1_epi8(64));
+            let (sl, sh, el, eh) = (st as u64, (st >> 64) as u64, en as u64, (en >> 64) as u64);
+            _mm512_storeu_si512(sb.as_mut_ptr() as *mut _, _mm512_maskz_compress_epi8(sl, il));
+            _mm512_storeu_si512(eb.as_mut_ptr() as *mut _, _mm512_maskz_compress_epi8(el, il));
+            if (sh | eh) != 0 {
+                _mm512_storeu_si512(sb.as_mut_ptr().add((sl.count_ones() as usize).min(64)) as *mut _, _mm512_maskz_compress_epi8(sh, ih));
+                _mm512_storeu_si512(eb.as_mut_ptr().add((el.count_ones() as usize).min(64)) as *mut _, _mm512_maskz_compress_epi8(eh, ih));
+            }
+            for (k, x) in f.iter_mut().enumerate() {
+                *x = (pos + sb[k] as usize, pos + eb[k] as usize);
+            }
+            row(&f);
+            pos = next;
+            continue;
+        }
         for x in f.iter_mut() {
             let a = st.trailing_zeros();
             st &= st - 1;
@@ -752,13 +794,58 @@ unsafe fn rd32(p: *const u8) -> u32 {
     std::ptr::read_unaligned(p as *const u32)
 }
 
+/// The CPU has AVX-512 F/BW/VBMI2 (the compress field split).
+fn avx512() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static ON: LazyLock<bool> = LazyLock::new(|| {
+            std::env::var_os("NO_AVX512").is_none()
+                && is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vbmi2")
+        });
+        *ON
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi2,avx2,bmi1,bmi2,popcnt,lzcnt")]
+unsafe fn parse_events_512(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
+    parse_events_w::<true>(cfg, base, lo, hi, out)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi2,avx2,bmi1,bmi2,popcnt,lzcnt")]
+unsafe fn parse_clicks_512(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u64, out: &mut Parts<CRec>) {
+    parse_clicks_w::<true>(cfg, base, lo, hi, task, out)
+}
+
 unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
+    #[cfg(target_arch = "x86_64")]
+    if avx512() {
+        return parse_events_512(cfg, base, lo, hi, out);
+    }
+    parse_events_w::<false>(cfg, base, lo, hi, out)
+}
+
+unsafe fn parse_clicks(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u64, out: &mut Parts<CRec>) {
+    #[cfg(target_arch = "x86_64")]
+    if avx512() {
+        return parse_clicks_512(cfg, base, lo, hi, task, out);
+    }
+    parse_clicks_w::<false>(cfg, base, lo, hi, task, out)
+}
+
+#[inline(always)]
+unsafe fn parse_events_w<const W: bool>(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
     let (ws, we) = (cfg.ws, cfg.we);
 
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
-    scan::<7>(base, lo, hi, |f| {
+    scan_w::<7, W>(base, lo, hi, |f| {
         let (a, b) = f[0];
         if a == b {
             return;
@@ -802,10 +889,11 @@ unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &m
 }
 
 /// Invalid clicks are kept (camp DEAD): dedup comes before validation.
-unsafe fn parse_clicks(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u64, out: &mut Parts<CRec>) {
+#[inline(always)]
+unsafe fn parse_clicks_w<const W: bool>(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u64, out: &mut Parts<CRec>) {
     let (cs, we) = (cfg.ws - WEEK_MS, cfg.we);
     let mut ord = task << 32;
-    scan::<4>(base, lo, hi, |f| {
+    scan_w::<4, W>(base, lo, hi, |f| {
         let (a, b) = f[0];
         if a == b {
             return;
@@ -2146,10 +2234,10 @@ fn main() {
     let t_e = t0.elapsed();
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
-        "threads {} parts {}/{}/{} | setup {:.0} parse {:.0} dedup+route {:.0} sessions+write {:.0} campaigns {:.0} | total {:.0} ms | user rows {} campaign rows {}",
+        "threads {} parts {}/{}/{} | setup {:.0} parse {:.0} dedup+route {:.0} sessions+write {:.0} campaigns {:.0} | total {:.0} ms | user rows {} campaign rows {} | avx512 {}",
         nt, npe, npc, nq,
         ms(t_setup), ms(t_a - t_setup), ms(t_b - t_a), ms(t_d - t_b), ms(t_e - t_d), ms(t_e),
-        total_rows, merged.len()
+        total_rows, merged.len(), avx512() as u8
     );
     eprintln!("mem (rss/peak/minflt) setup {} parse {} dedup+route {} sessions+write {} end {}", m_setup, m_a, m_b, m_d, mem_now());
     if let Ok(st) = fs::read_to_string("/proc/self/stat") {
