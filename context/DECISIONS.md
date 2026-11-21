@@ -31,3 +31,8 @@ Status: in progress
 ## D-008 2026-11-21 Keep full Rust track despite research-engine-options "stop at <120 s"
 Why: the goal is rank, not passing; leaderboard tops are ~0.65-1 s on 20M. Fallback if full Rust stalls: hybrid d1 (Rust parse -> typed columns, Polars logic).
 Status: accepted
+
+## D-009 2026-11-21 No paid credits: plan usage only
+Why: user order. Extra usage is enabled on the account ($18.49 of $20 spent), and it only kicks in after the 5-hour limit fills.
+Rule: lead checks get_usage at every checkpoint. 5-hour >= 75%: no new Opus/Fable agents, cheap tier or Codex only (per codex-fallback memory). >= 88%: stop all agents, wait for the reset.
+Status: accepted

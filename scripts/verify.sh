@@ -44,6 +44,13 @@ last=$(tail -n 1 "$LOG")
 [ "$last" = "36/36 fixtures passed" ] || fail "fixtures: last line '$last'"
 echo "PASS fixtures: $last"
 
+# a2. regression cases from review findings (same layout as fixtures): all modes
+STEP=regress
+python scripts/run_fixtures.py regress -- $PIPE >"$LOG" 2>/dev/null
+last=$(tail -n 1 "$LOG")
+[ "$last" = "4/4 fixtures passed" ] || fail "regress: last line '$last'"
+echo "PASS regress: $last"
+
 # run_pipe NAME DATA OUT: run PIPE with stderr kept in $LOG; prints TIME when TIMED=1
 run_pipe() {
   local name=$1 data=$2 out=$3 t0 t1 ms t

@@ -21,3 +21,5 @@
 - 2026-11-21: Read review-rules-audit.md (3 confirmed bugs, latent); sent fixes to Sonnet round 2 ahead of perf.
 - 2026-11-21: Fresh Opus reviewer: confirmed SHIFT overflow + new CR_MARK byte-order bug (x\r vs x\x10). Forwarded to Sonnet; fix must keep \r intact.
 - 2026-11-21: Test kit committed: oracle sha256 guard, official dev holdout, invariants (check_inv.py), metamorphic (meta.py), FAST/META modes, verify.log, bench lock.
+- 2026-11-21: User: no paid credits. 5-hour usage 39% (resets 10:20Z). Usage gate rule D-009.
+- 2026-11-21: regress/R1-R4 committed (window overflow, \r vs \x10 order, \x1e, \x1f); old pipeline fails all 4, reference passes 4/4.
