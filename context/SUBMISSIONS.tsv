@@ -9,3 +9,4 @@ ts	id	commit	engine	result	note
 2026-11-21T20:12Z	BB-C88B59A4	3da92db	rust	0.84 s (official rank 70/296)	exp-mem2 chunked arenas + field bounds
 2026-11-21T21:13Z	BB-2286A99D	2ec16fe	rust	0.84 s (rank 72/308)	exp-mem3 peak RSS cut; time unchanged
 2026-11-21T22:14Z	BB-A41813B3	65dd67d	rust	0.84 s (rank 76/327)	exp-rec2 24 B records: no change on scorer; not merged
+2026-11-21T23:15Z	BB-A1BC8FC9	514ef52	rust	0.8593 s (best 0.84; rank 81/334)	exp-simd AVX-512 two-stage parse: CI -9% but slower on scorer -> reverted
