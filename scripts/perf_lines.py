@@ -8,7 +8,7 @@ top = int(sys.argv[2]) if len(sys.argv) > 2 else 60
 cnt = collections.Counter()
 total = 0
 for line in sys.stdin:
-    m = re.match(r"\s*(.+)\+0x([0-9a-f]+)\s*$", line)
+    m = re.match(r"\s*(?:[0-9a-f]+\s+)?(.+)\+0x([0-9a-f]+)\s*(?:\(.*\))?\s*$", line)
     total += 1
     if m:
         cnt[(m.group(1).strip(), int(m.group(2), 16))] += 1
