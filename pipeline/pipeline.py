@@ -329,7 +329,7 @@ def run(seed):
     camp_idx = campaigns.select("campaign_id").with_row_index("cidx").with_columns(pl.col("cidx").cast(pl.Int64))
     ck = (ck.lazy()
           .filter(pl.col("click_id").is_not_null())
-          .unique("click_id", keep="any")
+          .unique("click_id", keep="first", maintain_order=True)
           .pipe(add_ts, "ts", "t")
           .filter(pl.col("user_id").is_not_null() & pl.col("t").is_not_null()
                   & (pl.col("t") >= c_start) & (pl.col("t") < w_end))

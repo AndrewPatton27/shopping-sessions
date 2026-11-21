@@ -31,3 +31,4 @@
 - 2026-11-21: Opus native review: no confirmed rule bugs or default-run UB; 200-seed fuzz 0 mismatches; Parquet readable by pyarrow/duckdb/polars/pandas. Follow-ups to Haiku: read_range zero-fill, bits_for div0 guard, fuzz.py + FUZZ=1 in verify.
 - 2026-11-21: Rust safety: read_range zero-fill (no set_len UB), bits_for div0 guard. Interleaved 10M timing old vs new: no measurable change. Committed.
 - 2026-11-21: fuzz.py + FUZZ=1 committed. Native PASS 50 seeds; Polars fallback FAILS seed 17 (click person mapping) -> Sonnet round 3.
+- 2026-11-21: Polars fallback: click dedup keep=first (file order) like reference; fuzz 1-200 PASS. Native wide fuzz seeds 51-400 run.
