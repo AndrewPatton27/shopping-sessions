@@ -3,22 +3,25 @@
 Updated: 2026-11-21 by Opus lead.
 
 ## Done
-- Track chosen; reference.py + pipeline.py both 36/36; MATCH on seeds 1-3 and 2M set.
-- Dockerfile/requirements moved to Polars (not built: no Docker locally).
+- Repo github.com/AndrewPatton27/shopping-sessions (PRIVATE; user must OK public before any submission). Latest: 7617bfc.
+- Native Rust (std only) is the shipped engine: Dockerfile builds it (x86-64-v3). Polars fallback: Dockerfile.polars.
+- Rust: full verify + META PASS; official 1M dev 0.1 s; 10M 0.9 s (Polars 7.8 s), outputs identical.
+- Test kit: oracle sha256 guard, fixtures 36, regress R1-R4, official dev holdout, invariants, metamorphic, FAST mode, bench lock.
 
 ## In progress
-- Sonnet: speed work on `starter/starter-duckdb/pipeline/pipeline.py` (owns only that file).
-- Haiku: `scripts/verify.sh` + `.claude/skills/verify-pipeline/SKILL.md`.
+- Opus reviewer: read-only audit of native/ (unsafe blocks, rules, Parquet validity, 60M hazards).
+- Sonnet: perf round on native/src (owns native/ only).
 
 ## Next 3 steps
-1. Run `bash scripts/verify.sh` on Sonnet's result; fresh read-only reviewer vs rules.md.
-2. Add `scripts/bench.sh` + `bench/results.tsv` (median of 3, append-only).
-3. User: allow the official generator, install Docker or create the GitHub repo, then submit.
+1. Apply reviewer findings (to Sonnet as owner), re-verify, commit.
+2. Time 20M official set; keep peak RSS well under 24 GB at 60M.
+3. When user makes repo public: submit (max 1/hour), log score in context/SUBMISSIONS.tsv.
 
 ## Do not retry
-- Capture-group regex for timestamps (6 s of 13 s on 2M).
-- winget rustup install (killed, exit 0xC000013A); rustup-init -y works.
-- (resolved) generator now allowed and built: gen/generator/target/release/generate.exe
+- Fable model: billed to paid extra usage ($1.82 spent, cap hit). Banned (D-010).
+- Capture-group regex in Polars; CR_MARK global swap (breaks byte order); fixed SHIFT=2^31.
+- Absolute PIPE paths with spaces in verify.sh: use `./native/...`.
 
 ## Resume
-`cd starter/starter-duckdb && bash scripts/verify.sh`. Nothing committed; no git repo for the entry yet.
+`cd starter/starter-duckdb && PIPE=./native/target-v3/release/shopping-sessions.exe bash scripts/verify.sh`
+Usage rule: 5-hour >= 75% cheap tier only; >= 95% stop all agents until reset.

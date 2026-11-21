@@ -1382,7 +1382,8 @@ fn main() {
         campaigns,
         pe_bits: bits_for(est_ev, 65536),
         pc_bits: bits_for(est_ck, 65536),
-        q_bits: bits_for(est_ev, 32768),
+        // big person partitions: fewer scatter streams in stage C (measured -100 ms at 20M)
+        q_bits: bits_for(est_ev, 262144),
         exp: std::env::var("EXP").ok().and_then(|s| s.parse().ok()).unwrap_or(0),
     };
     let (npe, npc, nq) = (1usize << cfg.pe_bits, 1usize << cfg.pc_bits, 1usize << cfg.q_bits);
