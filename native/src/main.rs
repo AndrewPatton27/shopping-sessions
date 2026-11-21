@@ -794,7 +794,7 @@ unsafe fn rd32(p: *const u8) -> u32 {
     std::ptr::read_unaligned(p as *const u32)
 }
 
-/// The CPU has AVX-512 F/BW/VBMI2 (the compress field split).
+/// The CPU has AVX-512 F/BW/DQ/VBMI2 (compress field split, 16-lane timestamps).
 fn avx512() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -802,6 +802,7 @@ fn avx512() -> bool {
             std::env::var_os("NO_AVX512").is_none()
                 && is_x86_feature_detected!("avx512f")
                 && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512dq")
                 && is_x86_feature_detected!("avx512vbmi2")
         });
         *ON
@@ -811,13 +812,13 @@ fn avx512() -> bool {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi2,avx2,bmi1,bmi2,popcnt,lzcnt")]
+#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vbmi2,avx2,bmi1,bmi2,popcnt,lzcnt")]
 unsafe fn parse_events_512(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
     parse_events_w::<true>(cfg, base, lo, hi, out)
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi2,avx2,bmi1,bmi2,popcnt,lzcnt")]
+#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vbmi2,avx2,bmi1,bmi2,popcnt,lzcnt")]
 unsafe fn parse_clicks_512(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u64, out: &mut Parts<CRec>) {
     parse_clicks_w::<true>(cfg, base, lo, hi, task, out)
 }
@@ -840,52 +841,147 @@ unsafe fn parse_clicks(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u
 
 #[inline(always)]
 unsafe fn parse_events_w<const W: bool>(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
-    let (ws, we) = (cfg.ws, cfg.we);
+    if W {
+        // AVX-512: rows collect 16 at a time; their ts and ingest_ts columns
+        // are parsed 16 lanes at once, then each row is finished on its own
+        let mut bt = Batch16 { f: [[(0, 0); 7]; 16], ta: [0; 16], tn: [0; 16], ia: [0; 16], inn: [0; 16], cnt: 0 };
+        scan_w::<7, W>(base, lo, hi, |f| {
+            if f[0].0 == f[0].1 {
+                return;
+            }
+            let i = bt.cnt;
+            *bt.f.get_unchecked_mut(i) = *f;
+            *bt.ta.get_unchecked_mut(i) = f[2].0 as u32;
+            *bt.tn.get_unchecked_mut(i) = (f[2].1 - f[2].0) as u32;
+            *bt.ia.get_unchecked_mut(i) = f[3].0 as u32;
+            *bt.inn.get_unchecked_mut(i) = (f[3].1 - f[3].0) as u32;
+            bt.cnt = i + 1;
+            if i == 15 {
+                bt.run(cfg, base, out);
+            }
+        });
+        if bt.cnt > 0 {
+            bt.run(cfg, base, out);
+        }
+        return;
+    }
+    scan_w::<7, W>(base, lo, hi, |f| {
+        if f[0].0 == f[0].1 {
+            return;
+        }
+        let ing = cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX);
+        event_row(cfg, base, f, ing, || cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0), out);
+    });
+}
 
+/// Up to 16 event rows (non-empty event_id) waiting for the 16-lane
+/// timestamp parse: their fields, and the ts / ingest_ts starts and lengths.
+struct Batch16 {
+    f: [[(usize, usize); 7]; 16],
+    ta: [u32; 16],
+    tn: [u32; 16],
+    ia: [u32; 16],
+    inn: [u32; 16],
+    cnt: usize,
+}
+
+impl Batch16 {
+    #[inline(always)]
+    unsafe fn run(&mut self, cfg: &Cfg, base: *const u8, out: &mut Parts<ERec>) {
+        let n = self.cnt;
+        self.cnt = 0;
+        // unused lanes repeat lane 0 (readable bytes; results ignored)
+        for i in n..16 {
+            self.ta[i] = self.ta[0];
+            self.tn[i] = self.tn[0];
+            self.ia[i] = self.ia[0];
+            self.inn[i] = self.inn[0];
+        }
+        let mut tv = [0i64; 16];
+        let mut iv = [0i64; 16];
+        let (ts_slow, ing_slow) = {
+            #[cfg(target_arch = "x86_64")]
+            {
+                (cfg.cal.parse16(base, &self.ta, &self.tn, false, &mut tv), cfg.cal.parse16(base, &self.ia, &self.inn, true, &mut iv))
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                (u16::MAX, u16::MAX)
+            }
+        };
+        for i in 0..n {
+            let f = &self.f[i];
+            {
+                let want = cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0);
+                let got = if (ts_slow >> i) & 1 != 0 { want } else if tv[i] == i64::MIN { None } else { Some(tv[i]) };
+                let wi = cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0);
+                let gi = if (ing_slow >> i) & 1 != 0 { wi } else { Some(iv[i]) };
+                if want != got || wi != gi {
+                    panic!("XCHECK {:?} {:?} {:?} {:?} {:?} {:?}", String::from_utf8_lossy(std::slice::from_raw_parts(base.add(f[2].0), f[2].1 - f[2].0)), want, got, String::from_utf8_lossy(std::slice::from_raw_parts(base.add(f[3].0), f[3].1 - f[3].0)), wi, gi);
+                }
+            }
+            let ing = if (ing_slow >> i) & 1 != 0 {
+                cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX)
+            } else {
+                iv[i]
+            };
+            let slow = (ts_slow >> i) & 1 != 0;
+            let t = tv[i];
+            event_row(
+                cfg,
+                base,
+                f,
+                ing,
+                || if slow { cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0) } else if t == i64::MIN { None } else { Some(t) },
+                out,
+            );
+        }
+    }
+}
+
+/// One event row with a non-empty event_id, given its ingest time and its
+/// ts parser (called only once the cheaper checks pass).
+#[inline(always)]
+unsafe fn event_row(cfg: &Cfg, base: *const u8, f: &[(usize, usize); 7], ing: i64, ts: impl FnOnce() -> Option<i64>, out: &mut Parts<ERec>) {
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
-    scan_w::<7, W>(base, lo, hi, |f| {
-        let (a, b) = f[0];
-        if a == b {
-            return;
+    let (ws, we) = (cfg.ws, cfg.we);
+    let (a, b) = f[0];
+    let eid = key_of(base.add(a), b - a);
+    let mut r = ERec { eid, user: 0, ing, ts: DEAD, pc: 0 };
+    'v: {
+        let (ua, ub) = f[1];
+        let (pa, pb) = f[5];
+        let (ta, tb) = f[4];
+        if ua == ub || pa == pb {
+            break 'v;
         }
-        let eid = key_of(base.add(a), b - a);
-        let ing = cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX);
-        let mut r = ERec { eid, user: 0, ing, ts: DEAD, pc: 0 };
-        'v: {
-            let (ua, ub) = f[1];
-            let (pa, pb) = f[5];
-            let (ta, tb) = f[4];
-            if ua == ub || pa == pb {
-                break 'v;
-            }
-            let tl = tb - ta;
-            let purchase = tl == 8 && std::ptr::read_unaligned(base.add(ta) as *const u64) == PURCHASE;
-            let w = rd32(base.add(ta));
-            if !purchase & !((tl == 4) & ((w == VIEW) | (w == CART))) {
-                break 'v;
-            }
-            let ts = match cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0) {
-                Some(t) if t >= ws && t < we => t,
-                _ => break 'v,
+        let tl = tb - ta;
+        let purchase = tl == 8 && std::ptr::read_unaligned(base.add(ta) as *const u64) == PURCHASE;
+        let w = rd32(base.add(ta));
+        if !purchase & !((tl == 4) & ((w == VIEW) | (w == CART))) {
+            break 'v;
+        }
+        let ts = match ts() {
+            Some(t) if t >= ws && t < we => t,
+            _ => break 'v,
+        };
+        if ing.saturating_sub(ts) > DAY_MS {
+            break 'v;
+        }
+        if purchase {
+            let price = match parse_price(std::slice::from_raw_parts(base.add(f[6].0), f[6].1 - f[6].0)) {
+                Some(p) => p,
+                None => break 'v,
             };
-            if ing.saturating_sub(ts) > DAY_MS {
-                break 'v;
-            }
-            if purchase {
-                let price = match parse_price(std::slice::from_raw_parts(base.add(f[6].0), f[6].1 - f[6].0)) {
-                    Some(p) => p,
-                    None => break 'v,
-                };
-                let cat = key_find(base.add(pa), pb - pa).and_then(|k| cfg.products.get(k)).unwrap_or(cfg.unknown_cat);
-                r.pc = (price << 8) | cat;
-            }
-            r.user = key_of(base.add(ua), ub - ua);
-            r.ts = (ts - ws) as u32;
+            let cat = key_find(base.add(pa), pb - pa).and_then(|k| cfg.products.get(k)).unwrap_or(cfg.unknown_cat);
+            r.pc = (price << 8) | cat;
         }
-        out.push(part_of(mix(eid), cfg.pe_bits), r);
-    });
+        r.user = key_of(base.add(ua), ub - ua);
+        r.ts = (ts - ws) as u32;
+    }
+    out.push(part_of(mix(eid), cfg.pe_bits), r);
 }
 
 /// Invalid clicks are kept (camp DEAD): dedup comes before validation.
