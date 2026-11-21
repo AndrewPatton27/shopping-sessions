@@ -363,8 +363,7 @@ fn read_range(f: &mut File, from: u64, to: u64, buf: &mut Vec<u8>) {
     let old = buf.len();
     buf.reserve(n + 128);
     f.seek(SeekFrom::Start(from)).expect("seek");
-    // no zero-fill: read_exact overwrites every byte (or we panic)
-    unsafe { buf.set_len(old + n) };
+    buf.resize(old + n, 0);
     f.read_exact(&mut buf[old..]).expect("read");
 }
 
