@@ -12,3 +12,4 @@ native/target/
 .claude/logs/
 bench/verify.log
 native/target-v3/
+native/target-asm/
