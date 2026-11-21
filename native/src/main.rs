@@ -373,37 +373,19 @@ unsafe fn scan<const NF: usize>(base: *const u8, lo: usize, hi: usize, mut row: 
         // field starts (after each separator) and ends (at each separator),
         // moved inward past a field's quotes: then field i is the i-th set
         // bit of each mask, with no per-field shifts or quote tests
-        let st = (((c << 1) | 1) & !qs) | (qs << 1);
-        let en = (sp & !(qe << 1)) | qe;
-        let (sb, eb) = (flat::<NF>(st), flat::<NF>(en));
+        let mut st = (((c << 1) | 1) & !qs) | (qs << 1);
+        let mut en = (sp & !(qe << 1)) | qe;
         let mut f = [(0usize, 0usize); NF];
-        for (k, x) in f.iter_mut().enumerate() {
-            *x = (pos + sb[k] as usize, pos + eb[k] as usize);
+        for x in f.iter_mut() {
+            let a = st.trailing_zeros();
+            st &= st - 1;
+            let e = en.trailing_zeros();
+            en &= en - 1;
+            *x = (pos + a as usize, pos + e as usize);
         }
         row(&f);
         pos = next;
     }
-}
-
-/// Offsets of the first NF set bits of m (which has at most NF), in order.
-/// Each 64-bit half runs its own fixed-length tzcnt chain (no u128 carries,
-/// no branch on the bit count); the high half's offsets are written after the
-/// low half's count, over the low chain's spare entries.
-#[inline(always)]
-fn flat<const NF: usize>(m: u128) -> [u8; 16] {
-    const { assert!(2 * NF <= 16) };
-    let mut o = [0u8; 16];
-    let (mut lo, mut hi) = (m as u64, (m >> 64) as u64);
-    let c = lo.count_ones() as usize;
-    for x in o.iter_mut().take(NF) {
-        *x = lo.trailing_zeros() as u8;
-        lo &= lo.wrapping_sub(1);
-    }
-    for i in 0..NF {
-        o[(c + i) & 15] = 64 + hi.trailing_zeros() as u8;
-        hi &= hi.wrapping_sub(1);
-    }
-    o
 }
 
 /// One line of 128 bytes or more, scalar. Returns the next line's start.
@@ -820,7 +802,7 @@ unsafe fn rd32(p: *const u8) -> u32 {
 }
 
 /// AVX2 build: event rows take the 8-lane batch.
-const LANES8: bool = false;
+const LANES8: bool = cfg!(all(target_arch = "x86_64", target_feature = "avx2"));
 
 unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
     if LANES8 {
