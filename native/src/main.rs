@@ -1,8 +1,9 @@
 //! Shopping Sessions: native pipeline. See README.md for the design.
 //!
 //! Stages (each one parallel over NCPU threads):
-//!   A  parse. Thread 0 builds the link table while the others parse clicks;
-//!      then every valid event row is mapped to its person at once and written
+//!   A  parse. Thread 0 builds the link table while the others parse (event
+//!      rows parsed before it is ready wait in a per-thread queue); every valid
+//!      event row is mapped to its person and written
 //!      once, as a 16 B record in the partition of hash(person), plus a 16 B
 //!      dedup record (event_id, ingest_ts, where the row went) in the partition
 //!      of hash(event_id). Clicks: one 32 B record per hash(click_id).
@@ -694,6 +695,8 @@ const RING: usize = 16;
 struct EvOut {
     pe: Parts<PRec>,
     pd: Parts<DRec>,
+    /// rows parsed before the link table was ready
+    q: Vec<PendE>,
 }
 
 #[inline(always)]
@@ -709,7 +712,7 @@ fn emit_e(cfg: &Cfg, links: &Links, p: &PendE, out: &mut EvOut) {
     out.pd.push(part_of(mix(p.eid), cfg.pe_bits), DRec { eid: p.eid, ing: p.ing, loc });
 }
 
-unsafe fn parse_events(cfg: &Cfg, links: &Links, base: *const u8, lo: usize, hi: usize, out: &mut EvOut) {
+unsafe fn parse_events(cfg: &Cfg, links: Option<&Links>, base: *const u8, lo: usize, hi: usize, out: &mut EvOut) {
     let (ws, we) = (cfg.ws, cfg.we);
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
@@ -762,19 +765,37 @@ unsafe fn parse_events(cfg: &Cfg, links: &Links, base: *const u8, lo: usize, hi:
             }
             let u = key_of(base.add(ua), ub - ua);
             let h = mix(u);
+            let pend = PendE { u, h, eid, key: (((ts - ws) as u64) << 32) | pc as u64, ing };
+            let Some(links) = links else {
+                out.q.push(pend);
+                return;
+            };
             links.prefetch(h);
             let s = k & (RING - 1);
             if k >= RING {
                 emit_e(cfg, links, &ring[s], out);
             }
-            ring[s] = PendE { u, h, eid, key: (((ts - ws) as u64) << 32) | pc as u64, ing };
+            ring[s] = pend;
             k += 1;
             return;
         }
         out.pd.push(part_of(mix(eid), cfg.pe_bits), DRec { eid, ing, loc: INV });
     });
-    for j in k.saturating_sub(RING)..k {
-        emit_e(cfg, links, &ring[j & (RING - 1)], out);
+    if let Some(links) = links {
+        for j in k.saturating_sub(RING)..k {
+            emit_e(cfg, links, &ring[j & (RING - 1)], out);
+        }
+    }
+}
+
+/// Emits the rows a thread parsed before the link table was ready.
+fn drain_deferred(cfg: &Cfg, links: &Links, out: &mut EvOut) {
+    let q = std::mem::take(&mut out.q);
+    for (i, p) in q.iter().enumerate() {
+        if let Some(n) = q.get(i + RING) {
+            links.prefetch(n.h);
+        }
+        emit_e(cfg, links, p, out);
     }
 }
 
@@ -1695,7 +1716,7 @@ fn main() {
     chunks(&ln_files, Kind::Events, &mut ltasks);
     let t_setup = t0.elapsed();
 
-    // ---- stage A: parse; thread 0 first builds the links, events wait for them
+    // ---- stage A: parse; thread 0 first builds the links
     let links: OnceLock<Links> = OnceLock::new();
     let next = AtomicUsize::new(0);
     // a thread's share of rows, with headroom; overflow spills
@@ -1723,7 +1744,7 @@ fn main() {
                         }
                         let _ = links.set(build_links(&pairs));
                     }
-                    let mut eo = EvOut { pe: Parts::<PRec>::new(nq, per_e), pd: Parts::<DRec>::new(npe, per_d) };
+                    let mut eo = EvOut { pe: Parts::<PRec>::new(nq, per_e), pd: Parts::<DRec>::new(npe, per_d), q: Vec::new() };
                     let mut pc = Parts::<CRec>::new(npc, per_c);
                     loop {
                         let i = next.fetch_add(1, AO::Relaxed);
@@ -1743,10 +1764,13 @@ fn main() {
                         let base = buf.as_ptr();
                         unsafe {
                             match tk.kind {
-                                Kind::Events => parse_events(cfg, links.wait(), base, lo, hi, &mut eo),
+                                Kind::Events => parse_events(cfg, links.get(), base, lo, hi, &mut eo),
                                 Kind::Clicks => parse_clicks(cfg, base, lo, hi, i as u64, &mut pc),
                             }
                         }
+                    }
+                    if !eo.q.is_empty() {
+                        drain_deferred(cfg, links.wait(), &mut eo);
                     }
                     (eo, pc)
                 })
