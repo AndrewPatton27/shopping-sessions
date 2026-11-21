@@ -911,15 +911,6 @@ impl Batch16 {
         };
         for i in 0..n {
             let f = &self.f[i];
-            {
-                let want = cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0);
-                let got = if (ts_slow >> i) & 1 != 0 { want } else if tv[i] == i64::MIN { None } else { Some(tv[i]) };
-                let wi = cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0);
-                let gi = if (ing_slow >> i) & 1 != 0 { wi } else { Some(iv[i]) };
-                if want != got || wi != gi {
-                    panic!("XCHECK {:?} {:?} {:?} {:?} {:?} {:?}", String::from_utf8_lossy(std::slice::from_raw_parts(base.add(f[2].0), f[2].1 - f[2].0)), want, got, String::from_utf8_lossy(std::slice::from_raw_parts(base.add(f[3].0), f[3].1 - f[3].0)), wi, gi);
-                }
-            }
             let ing = if (ing_slow >> i) & 1 != 0 {
                 cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX)
             } else {
