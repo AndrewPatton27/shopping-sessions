@@ -72,6 +72,8 @@ jobs:
           IMAGE=ss CPUS=$(nproc) MEM=6g scripts/docker_run.sh /tmp/data /tmp/outd
           end=$(date +%s%N)
           echo $(( (end - start) / 1000000 )) > docker_ms.txt
+          echo "DOCKER_RUN_MS $(cat docker_ms.txt)"
+          for i in 1 2 3; do s=$(date +%s%N); docker run --rm --network none --read-only --user 1000:1000 --entrypoint /bin/true ss; e=$(date +%s%N); echo "EMPTY_CONTAINER_MS $(( (e - s) / 1000000 ))"; done
       - name: Summary
         if: inputs.modes == ''
         run: |
