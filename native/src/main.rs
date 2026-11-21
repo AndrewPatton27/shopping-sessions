@@ -382,13 +382,22 @@ unsafe fn slow_line<const NF: usize>(base: *const u8, pos: usize, row: &mut impl
     next
 }
 
-fn read_range(f: &mut File, from: u64, to: u64, buf: &mut Vec<u8>) {
+/// Grows buf (zero-filling only the new part) to at least n bytes. buf is a
+/// reused read buffer: its length is a high-water mark, every byte below it
+/// initialized, so a chunk is read over the previous one with no fill first.
+fn ensure(buf: &mut Vec<u8>, n: usize) {
+    if buf.len() < n {
+        buf.resize(n.max(buf.len() * 5 / 4), 0);
+    }
+}
+
+/// Reads [from, to) of f into buf at `at`; returns at + (to - from).
+fn read_range(f: &mut File, from: u64, to: u64, buf: &mut Vec<u8>, at: usize) -> usize {
     let n = (to - from) as usize;
-    let old = buf.len();
-    buf.reserve(n + 256);
+    ensure(buf, at + n);
     f.seek(SeekFrom::Start(from)).expect("seek");
-    buf.resize(old + n, 0);
-    f.read_exact(&mut buf[old..]).expect("read");
+    f.read_exact(&mut buf[at..at + n]).expect("read");
+    at + n
 }
 
 #[inline]
@@ -397,15 +406,14 @@ fn find_nl(s: &[u8]) -> Option<usize> {
 }
 
 /// Loads the lines of `f` that start in [s, e) into `buf`, minus the header.
-/// Returns (lo, hi) for scan.
+/// Returns (lo, hi) for scan; buf[hi] is '\n', followed by 192 zero bytes.
 fn load_chunk(f: &mut File, s: u64, e: u64, fsize: u64, buf: &mut Vec<u8>) -> (usize, usize) {
-    buf.clear();
     if fsize == 0 || s >= e {
         return (0, 0);
     }
     let rs = if s == 0 { 0 } else { s - 1 };
     let mut rend = (e + 512).min(fsize);
-    read_range(f, rs, rend, buf);
+    let mut used = read_range(f, rs, rend, buf, 0);
     let lim = (e - 1 - rs) as usize; // index of the chunk's last byte
     let mut lo = 0usize;
     if s > 0 {
@@ -418,21 +426,20 @@ fn load_chunk(f: &mut File, s: u64, e: u64, fsize: u64, buf: &mut Vec<u8>) -> (u
     // the last line of the chunk ends at the first '\n' at or after e-1 (or EOF)
     let mut from = lim;
     let hi = loop {
-        if let Some(i) = find_nl(&buf[from..]) {
+        if let Some(i) = find_nl(&buf[from..used]) {
             break from + i;
         }
         if rend >= fsize {
-            break buf.len();
+            break used;
         }
-        from = buf.len();
+        from = used;
         let nend = (rend + (rend - rs).max(4096)).min(fsize);
-        read_range(f, rend, nend, buf);
+        used = read_range(f, rend, nend, buf, used);
         rend = nend;
     };
-    if hi == buf.len() {
-        buf.push(b'\n');
-    }
-    buf.extend_from_slice(&[0u8; 192]);
+    ensure(buf, hi + 1 + 192);
+    buf[hi] = b'\n';
+    buf[hi + 1..hi + 1 + 192].fill(0);
     if s == 0 {
         lo = match find_nl(&buf[..hi]) {
             Some(i) => i + 1,
@@ -1128,19 +1135,38 @@ struct CampAgg {
     assisted: i64,
 }
 
+/// Per-thread credited counts of one (day, campaign): 16 B, so the table a
+/// thread updates once per session is half the cache lines of CampAgg.
+#[derive(Clone, Copy, Default)]
+struct Cred {
+    sessions: u32,
+    purchasing: u32,
+    revenue: i64,
+}
+
 /// Dense: rows by (day, campaign), plus the assisted counts as their own
 /// small array, so one session's assist increments hit one short run of it.
 enum CampTab {
-    Dense(Vec<CampAgg>, Vec<u32>, usize),
+    Dense(Vec<Cred>, Vec<u32>, usize),
     Sparse(HashMap<(u32, u32), CampAgg>),
 }
 
 impl CampTab {
     #[inline(always)]
-    fn at(&mut self, camp: u32, day: u32) -> &mut CampAgg {
+    fn credit(&mut self, camp: u32, day: u32, purchased: bool, rev: i64) {
         match self {
-            CampTab::Dense(v, _, nc) => unsafe { v.get_unchecked_mut(day as usize * *nc + camp as usize) },
-            CampTab::Sparse(m) => m.entry((camp, day)).or_default(),
+            CampTab::Dense(v, _, nc) => {
+                let r = unsafe { v.get_unchecked_mut(day as usize * *nc + camp as usize) };
+                r.sessions += 1;
+                r.purchasing += purchased as u32;
+                r.revenue += rev;
+            }
+            CampTab::Sparse(m) => {
+                let r = m.entry((camp, day)).or_default();
+                r.sessions += 1;
+                r.purchasing += purchased as i64;
+                r.revenue += rev;
+            }
         }
     }
     #[inline(always)]
@@ -1171,6 +1197,23 @@ struct UOut {
     evc: Vec<i32>,
     rev: Vec<i64>,
     cat: Vec<u32>,
+}
+
+impl UOut {
+    /// Reserved for about `n` rows, so the columns grow without reallocating
+    /// (each doubling copies the column into fresh pages the kernel zeroes).
+    fn with_rows(n: usize) -> UOut {
+        UOut {
+            uid: Vec::with_capacity(n * 14),
+            marks: Vec::with_capacity(n / RG_ROWS + 1),
+            day: Vec::with_capacity(n),
+            sess: Vec::with_capacity(n),
+            evc: Vec::with_capacity(n),
+            rev: Vec::with_capacity(n),
+            cat: Vec::with_capacity(n),
+            ..UOut::default()
+        }
+    }
 }
 
 struct Agg {
@@ -1305,10 +1348,7 @@ impl Agg {
                     self.camp.assist(&self.active, d);
                 }
             }
-            let r = self.camp.at(credit, d);
-            r.sessions += 1;
-            r.purchasing += purchased as i64;
-            r.revenue += rev;
+            self.camp.credit(credit, d, purchased, rev);
         }
         if cur_day != i64::MIN {
             self.flush_row(cur_day, r_sess, r_ev, r_rev);
@@ -1483,8 +1523,10 @@ unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut
         acc += c;
     }
     b.off.push(acc);
-    b.evs.clear();
-    b.evs.resize(n, 0);
+    // every slot below n is written by the scatter: grow only, never refill
+    if b.evs.len() < n {
+        b.evs.resize(n, 0);
+    }
     let mut k = 0usize;
     for &(ptr, len) in &b.segs {
         for e in std::slice::from_raw_parts(ptr.0, len) {
@@ -1522,8 +1564,9 @@ unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut
             *x = acc;
             acc += c;
         }
-        b.cks.clear();
-        b.cks.resize(ncl as usize, CK { cid: 0, ts: 0, camp: 0 });
+        if b.cks.len() < ncl as usize {
+            b.cks.resize(ncl as usize, CK { cid: 0, ts: 0, camp: 0 });
+        }
         let mut k = 0usize;
         for &(ptr, len) in &b.csegs {
             for c in std::slice::from_raw_parts(ptr.0, len) {
@@ -1921,6 +1964,8 @@ fn main() {
     let mut order: Vec<(usize, usize)> = (0..nq).map(|q| (qes.iter().map(|c| c.len(q)).sum::<usize>(), q)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let next = AtomicUsize::new(0);
+    // user_daily rows run about one per 9 events; a thread's share plus headroom
+    let urows = (est_ev as usize / 8 / nt) * 5 / 4 + 1024;
     let mut camp_tabs: Vec<CampTab> = Vec::new();
     let mut total_rows = 0usize;
     std::thread::scope(|sc| {
@@ -1935,7 +1980,7 @@ fn main() {
                         day_min,
                         organic,
                         camp: if dense {
-                            CampTab::Dense(vec![CampAgg::default(); ncamp * ndays], vec![0; ncamp * ndays], ncamp)
+                            CampTab::Dense(vec![Cred::default(); ncamp * ndays], vec![0; ncamp * ndays], ncamp)
                         } else {
                             CampTab::Sparse(HashMap::new())
                         },
@@ -1945,7 +1990,7 @@ fn main() {
                         csum: vec![0; 256],
                         touched: Vec::new(),
                         cat_rank: cat_rank.clone(),
-                        out: UOut::default(),
+                        out: UOut::with_rows(urows),
                         name: Vec::new(),
                     };
                     let mut local = Local { slots: Vec::new(), mask: 0, keys: Vec::new() };
@@ -1982,8 +2027,8 @@ fn main() {
         for t in &camp_tabs {
             if let CampTab::Dense(v, a, _) = t {
                 for ((s, x), &y) in sum.iter_mut().zip(v.iter()).zip(a.iter()) {
-                    s.sessions += x.sessions;
-                    s.purchasing += x.purchasing;
+                    s.sessions += x.sessions as i64;
+                    s.purchasing += x.purchasing as i64;
                     s.revenue += x.revenue;
                     s.assisted += y as i64;
                 }
