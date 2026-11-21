@@ -46,3 +46,9 @@
 - 2026-11-21: Opus round 4: safe buffer reuse = noise; stopped rewrite (profile caps it ~5-8%). Lead thread scaling 20M local: 1T 3.0 s, 2T 1.65, 4T 1.0, 8T 0.91-1.25 -> hyperthreads ~useless; scorer ~= 4 cores. Fresh Opus (no anchoring) on first-principles design, target ~250 instr/row (now ~1040). CI measuring container startup.
 - 2026-11-21: CI 20M (4 vCPU): internal ~1.44-1.52 s; empty container start ~135-170 ms; docker_run.sh total 2.29 s (incl. its chmod cleanup container). Startup is a minor share of our 1.42 s; leaders' 0.31 s implies ~0.15 s compute (~12 GB/s) - extreme.
 - 2026-11-21: Fresh Opus exp-fresh merged (eid-partitioned parse, 64-bit packed keys, SSE timestamps, branch-free splits, link lookup in dedup stage, legacy fallback). Same-run CI 20M: ~1.13 vs ~1.50 s (-25%). Lead: META+fuzz 400 seeds PASS, 60M MATCH (agent).
+- 2026-11-21: BB-0FCE2247 (exp-fresh) 1.00 s, rank 73/273. Best so far.
+- 2026-11-21: exp-fresh2 rejected (+5% slower). Main design stays.
+- 2026-11-21: Sonnet exp-small: AVX-512 scanner (ran on CI, avx512 present) and headroom 6/5->9/8 both noise; nothing kept. Running perf profile on new main.
+- 2026-11-21: perf on new main (20M CI): parse_events 24%, 3 per-partition stage closures 23/17/14%, parse_clicks 6%, kernel zeroing 4%. Hot lines: partition push scatter main.rs:563-565 ~10%, field extraction 317-334 ~14%. Sonnet on SWWC (software write-combining) scatter, exp-swwc.
+- 2026-11-21: SWWC rejected. Next target: stages B/C (dedup+route, sessions+write) = ~54% of CPU per perf.
+- 2026-11-21: Opus exp-bc merged: 4-way cache-line link buckets with branch-free probe (mispredicts were the cost), day-major campaign table, NT-store staging scatter, LSD radix for big persons. Same-run CI 20M: 1074 -> 1039 ms (-3.3%). Lead: META + fuzz 1-50 + 401-600 PASS; agent 60M MATCH.
