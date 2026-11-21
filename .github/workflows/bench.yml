@@ -143,5 +143,5 @@ jobs:
           DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/op NCPU=$(nproc) $PERF record -q -F 1999 -e cpu-clock -o /tmp/perf.data $BIN 2>&1 | grep total || true
           echo "=== by symbol"
           $PERF report -i /tmp/perf.data --stdio --no-children --sort sym 2>/dev/null | grep -v "^#" | grep -v "^$" | head -30
-          echo "=== by srcline"
-          timeout 600 $PERF report -i /tmp/perf.data --stdio --no-children --sort srcline 2>/dev/null | grep -v "^#" | grep -v "^$" | head -60
+          echo "=== by source line"
+          $PERF script -i /tmp/perf.data -F sym,symoff 2>/dev/null | python3 scripts/perf_lines.py $BIN 70
