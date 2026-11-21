@@ -9,6 +9,12 @@ on:
       events:
         description: "Number of events to generate"
         default: "10000000"
+      modes:
+        description: "Scorer-emulation A/B modes (warm cold hog twin), space-separated; empty = standard bench"
+        default: ""
+      base:
+        description: "Base ref the modes A/B compares against"
+        default: "main"
 jobs:
   bench:
     runs-on: ubuntu-latest
@@ -38,6 +44,7 @@ jobs:
       - name: Warm page cache
         run: cat /tmp/data/*/*.csv /tmp/data/*.csv > /dev/null
       - name: Native runs (x5)
+        if: inputs.modes == ''
         run: |
           : > walls.txt; : > rss.txt
           for i in 1 2 3 4 5; do
@@ -49,6 +56,7 @@ jobs:
             grep "Maximum resident set size" run$i.err | awk '{print $NF}' >> rss.txt
           done
       - name: Compare output with main build
+        if: inputs.modes == ''
         run: |
           git fetch -q origin main
           git worktree add -q /tmp/base origin/main
@@ -57,6 +65,7 @@ jobs:
           pip install -q polars==2.0.0 pyarrow==25.0.1
           cd scripts && python compare.py /tmp/out1 /tmp/outbase1
       - name: Docker run (x1)
+        if: inputs.modes == ''
         run: |
           docker build -t ss .
           start=$(date +%s%N)
@@ -64,6 +73,7 @@ jobs:
           end=$(date +%s%N)
           echo $(( (end - start) / 1000000 )) > docker_ms.txt
       - name: Summary
+        if: inputs.modes == ''
         run: |
           median=$(sort -n walls.txt | sed -n 3p)
           peak=$(sort -n rss.txt | tail -1)
@@ -75,3 +85,46 @@ jobs:
             echo "| Native peak RSS (kB) | ${peak} |"
             echo "| Docker run wall (ms) | ${docker_ms} |"
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Modes A/B (scorer emulation)
+        if: inputs.modes != ''
+        env:
+          MODES: ${{ inputs.modes }}
+          BASE: ${{ inputs.base }}
+        run: |
+          git fetch -q origin "$BASE" || true
+          git worktree add -q /tmp/base "origin/$BASE" 2>/dev/null || git worktree add -q /tmp/base FETCH_HEAD
+          (cd /tmp/base/native && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q)
+          NEW=$PWD/native/target/release/shopping-sessions
+          OLD=/tmp/base/native/target/release/shopping-sessions
+          printf '#include <stdlib.h>
+#include <string.h>
+int main(){size_t n=256u<<20;char*a=malloc(n),*b=malloc(n);memset(a,1,n);memset(b,2,n);for(;;){memcpy(b,a,n);memcpy(a,b,n);}}
+' > /tmp/hog.c
+          gcc -O2 -o /tmp/hog /tmp/hog.c
+          lscpu | grep -E "Model name|Thread|Core|Socket|L3"
+          one() { # label bin cpus ncpu out
+            local t0 t1 tot
+            t0=$(date +%s%N)
+            tot=$(DATA_DIR=/tmp/data OUTPUT_DIR=$5 NCPU=$4 taskset -c $3 $2 2>&1 | grep -o "total [0-9]* ms")
+            t1=$(date +%s%N)
+            echo "$1 $tot wall $(( (t1 - t0) / 1000000 )) ms"
+          }
+          for mode in $MODES; do
+            for round in 1 2 3; do
+              for side in old new; do
+                if [ $side = old ]; then B=$OLD; else B=$NEW; fi
+                case $mode in
+                  warm) one "MODE warm $side" $B 0-3 4 /tmp/o_$side ;;
+                  cold) sync; echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+                        one "MODE cold $side" $B 0-3 4 /tmp/o_$side ;;
+                  warm3) one "MODE warm3 $side" $B 0-2 3 /tmp/o_$side ;;
+                  hog) taskset -c 3 /tmp/hog & H=$!; sleep 0.3
+                       one "MODE hog $side" $B 0-2 3 /tmp/o_$side; kill $H; wait $H 2>/dev/null ;;
+                  twin) one "MODE twin-a $side" $B 0-1 2 /tmp/o_$side & one "MODE twin-b $side" $B 2-3 2 /tmp/o2_$side; wait ;;
+                  solo2) one "MODE solo2 $side" $B 0-1 2 /tmp/o_$side ;;
+                esac
+              done
+            done
+          done
+          pip install -q polars==2.0.0 pyarrow==25.0.1
+          cd scripts && python compare.py /tmp/o_new /tmp/o_old
