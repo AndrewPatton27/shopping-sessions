@@ -283,15 +283,69 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
 /// with a quote ends with one: adding qs to the non-separator mask carries
 /// each start quote to its field's separator, which must equal qe << 1.
 #[inline(always)]
-unsafe fn scan<const NF: usize>(base: *const u8, lo: usize, hi: usize, mut row: impl FnMut(&[(usize, usize); NF])) {
+unsafe fn scan<const NF: usize>(base: *const u8, lo: usize, hi: usize, row: impl FnMut(&[(usize, usize); NF])) {
+    #[cfg(target_arch = "x86_64")]
+    if use_avx512() {
+        return scan512::<NF, _>(base, lo, hi, row);
+    }
+    scan_impl::<NF, false, _>(base, lo, hi, row)
+}
+
+/// AVX-512 is detected at runtime (SS_NO_AVX512 forces the fallback, for A/B).
+#[cfg(target_arch = "x86_64")]
+fn use_avx512() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static S: AtomicU8 = AtomicU8::new(0);
+    match S.load(Ordering::Relaxed) {
+        0 => {
+            let on = is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && std::env::var_os("SS_NO_AVX512").is_none();
+            S.store(1 + on as u8, Ordering::Relaxed);
+            on
+        }
+        v => v == 2,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn scan512<const NF: usize, F: FnMut(&[(usize, usize); NF])>(base: *const u8, lo: usize, hi: usize, row: F) {
+    scan_impl::<NF, true, F>(base, lo, hi, row)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn masks64_512(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let v = _mm512_loadu_si512(p as *const _);
+    (
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+    )
+}
+
+#[inline(always)]
+unsafe fn masks_sel<const W512: bool>(p: *const u8) -> (u64, u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    if W512 {
+        return masks64_512(p);
+    }
+    masks64(p)
+}
+
+#[inline(always)]
+unsafe fn scan_impl<const NF: usize, const W512: bool, F: FnMut(&[(usize, usize); NF])>(base: *const u8, lo: usize, hi: usize, mut row: F) {
     let mut pos = lo;
     while pos < hi {
         let p = base.add(pos);
-        let (c0, n0, q0) = masks64(p);
+        let (c0, n0, q0) = masks_sel::<W512>(p);
         let (c, n, q) = if n0 != 0 {
             (c0 as u128, n0 as u128, q0 as u128)
         } else {
-            let (c1, n1, q1) = masks64(p.add(64));
+            let (c1, n1, q1) = masks_sel::<W512>(p.add(64));
             (c0 as u128 | ((c1 as u128) << 64), (n1 as u128) << 64, q0 as u128 | ((q1 as u128) << 64))
         };
         if n == 0 {
@@ -1875,9 +1929,13 @@ fn main() {
     }
     let t_e = t0.elapsed();
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    #[cfg(target_arch = "x86_64")]
+    let avx512 = use_avx512();
+    #[cfg(not(target_arch = "x86_64"))]
+    let avx512 = false;
     eprintln!(
-        "threads {} parts {}/{}/{} | setup {:.0} parse {:.0} dedup+route {:.0} sessions+write {:.0} campaigns {:.0} | total {:.0} ms | user rows {} campaign rows {}",
-        nt, npe, npc, nq,
+        "threads {} avx512 {} parts {}/{}/{} | setup {:.0} parse {:.0} dedup+route {:.0} sessions+write {:.0} campaigns {:.0} | total {:.0} ms | user rows {} campaign rows {}",
+        nt, avx512 as u8, npe, npc, nq,
         ms(t_setup), ms(t_a - t_setup), ms(t_b - t_a), ms(t_d - t_b), ms(t_e - t_d), ms(t_e),
         total_rows, merged.len()
     );
