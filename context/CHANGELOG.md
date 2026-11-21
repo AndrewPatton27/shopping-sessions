@@ -52,3 +52,5 @@
 - 2026-11-21: perf on new main (20M CI): parse_events 24%, 3 per-partition stage closures 23/17/14%, parse_clicks 6%, kernel zeroing 4%. Hot lines: partition push scatter main.rs:563-565 ~10%, field extraction 317-334 ~14%. Sonnet on SWWC (software write-combining) scatter, exp-swwc.
 - 2026-11-21: SWWC rejected. Next target: stages B/C (dedup+route, sessions+write) = ~54% of CPU per perf.
 - 2026-11-21: Opus exp-bc merged: 4-way cache-line link buckets with branch-free probe (mispredicts were the cost), day-major campaign table, NT-store staging scatter, LSD radix for big persons. Same-run CI 20M: 1074 -> 1039 ms (-3.3%). Lead: META + fuzz 1-50 + 401-600 PASS; agent 60M MATCH.
+- 2026-11-21: BB-6695D6F9 (exp-bc) 0.88 s, rank 60/282. Lesson: branch-mispredict cuts pay more on scorer Xeon than on CI EPYC.
+- 2026-11-21: exp-br merged (KeyMap 4-key branch-free buckets, pack7 unconditional 9th byte, push_if route, 8-key link buckets). CI neutral; submitting to test on scorer Xeon. Lead: META + fuzz 601-800 PASS; agent 60M MATCH.
