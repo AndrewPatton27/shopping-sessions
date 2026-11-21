@@ -41,3 +41,5 @@
 - 2026-11-21: Opus exp-direct merged (25f155d): no person stage (link table built in parallel, rows mapped on parse), std-only huge-page allocator, word-parallel timestamps, 32 B dedup records. Same-run CI: total -13..18%, wall -24% (0.57-0.61 vs ~0.77). Lead verify: full+META+FUZZ PASS, 60M MATCH Polars (7.85 s local). Docker CI green.
 - 2026-11-21: BB-BB75F2BE scored 1.43 s (rank 134/258). Scorer gain 10% vs CI 24% -> scorer bottleneck differs (suspect memory bandwidth contention: 14 concurrent workers; or I/O).
 - 2026-11-21: Opus round 2: cold cache reproduces scorer's smaller gain; memory-traffic cuts no CI effect. Merged exp-io (fadvise WILLNEED prefetch, Linux-only; scorer-emulation bench modes). Verify FUZZ PASS. Submitting as cold-disk probe.
+- 2026-11-21: BB-0FF05D8C (fadvise prefetch) 1.42 s vs 1.43 s: cold-disk theory rejected. Scorer per-core slower than CI EPYC; need ~4x CPU-side cuts.
+- 2026-11-21: Opus round 3: perf profile flat (~1040 instr/row, top line 6%). Merged perf tooling (bench perf mode, scripts/perf_lines.py); rejected set_len no-zero-fill (UB). Next: dense u32 IDs + 16 B records, two-level partitions, separator index.

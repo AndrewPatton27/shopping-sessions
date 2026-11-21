@@ -1,3 +1,4 @@
 ts	id	commit	engine	result	note
 2026-11-21T12:40Z	BB-4E5D972D	12f18b6	rust	1.59 s (rank 147/250; top 0.31, 10th 0.64)	first submission; repo made public
 2026-11-21T13:41Z	BB-BB75F2BE	e357328	rust	1.43 s (rank 134/258; 10th 0.63, 25th 0.74, 50th 0.92, 100th 1.19)	exp-direct; CI predicted -24%, scorer gave -10%
+2026-11-21T14:42Z	BB-0FF05D8C	e5e2679	rust	1.42 s	cold-disk probe (fadvise prefetch): no gain -> scorer not cold-disk bound
