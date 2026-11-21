@@ -997,14 +997,20 @@ static KA: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('a'));
 static KF: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('f'));
 static KE: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('e'));
 static KL: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('l'));
+static KB: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('b'));
+static KLOOK: LazyLock<usize> = LazyLock::new(|| if KNOBS.contains('w') { 64 } else if KNOBS.contains('v') { 32 } else { 16 });
 static KD: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('d'));
 
 unsafe fn route_ev(segs: &[(Ptr<ERec>, usize)], links: &Links, qb: u32, out: &mut Parts<PRec>) {
+    if *KB {
+        return route_ev_b(segs, links, qb, out);
+    }
+    let look = *KLOOK;
     for &(ptr, len) in segs {
         let p = ptr.0;
         for i in 0..len {
-            if i + LOOK < len {
-                links.prefetch(mix((*p.add(i + LOOK)).user));
+            if i + look < len {
+                links.prefetch(mix((*p.add(i + look)).user));
             }
             let r = *p.add(i);
             if r.ts == DEAD {
@@ -1018,12 +1024,42 @@ unsafe fn route_ev(segs: &[(Ptr<ERec>, usize)], links: &Links, qb: u32, out: &mu
     }
 }
 
+/// Batched: hash and prefetch 64 rows, then look them up.
+unsafe fn route_ev_b(segs: &[(Ptr<ERec>, usize)], links: &Links, qb: u32, out: &mut Parts<PRec>) {
+    const B: usize = 64;
+    let mut hs = [0u64; B];
+    for &(ptr, len) in segs {
+        let p = ptr.0;
+        let mut s = 0usize;
+        while s < len {
+            let m = (len - s).min(B);
+            for t in 0..m {
+                let h = mix((*p.add(s + t)).user);
+                hs[t] = h;
+                links.prefetch(h);
+            }
+            for t in 0..m {
+                let r = *p.add(s + t);
+                if r.ts == DEAD {
+                    continue;
+                }
+                let hu = hs[t];
+                let person = links.lookup(r.user, hu);
+                let hp = if person == r.user { hu } else { mix(person) };
+                out.push(part_of(hp, qb), PRec { person, key: ((r.ts as u64) << 32) | r.pc as u64 });
+            }
+            s += m;
+        }
+    }
+}
+
 unsafe fn route_ck(segs: &[(Ptr<CRec>, usize)], links: &Links, qb: u32, out: &mut Parts<PCk>) {
+    let look = *KLOOK;
     for &(ptr, len) in segs {
         let p = ptr.0;
         for i in 0..len {
-            if i + LOOK < len {
-                links.prefetch(mix((*p.add(i + LOOK)).user));
+            if i + look < len {
+                links.prefetch(mix((*p.add(i + look)).user));
             }
             let r = *p.add(i);
             if r.camp == DEAD {
