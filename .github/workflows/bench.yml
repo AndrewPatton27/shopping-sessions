@@ -55,6 +55,15 @@ jobs:
             grep "Elapsed (wall clock)" run$i.err | awk -F': ' '{print $2}' | awk -F: '{ if (NF==3) print $1*3600+$2*60+$3; else print $1*60+$2 }' >> walls.txt
             grep "Maximum resident set size" run$i.err | awk '{print $NF}' >> rss.txt
           done
+      - name: Click batch A/B (temporary)
+        if: inputs.modes == ''
+        run: |
+          lscpu | grep -E "Model name|Flags" | cut -c1-60
+          grep -o -w -E "avx512vbmi2|avx512dq" /proc/cpuinfo | sort -u
+          for i in 1 2 3 4; do
+            DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/oab NCPU=$(nproc) native/target/release/shopping-sessions 2>&1 | head -1 | sed "s/^/CB_ON /"
+            NO_CBATCH=1 DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/oab NCPU=$(nproc) native/target/release/shopping-sessions 2>&1 | head -1 | sed "s/^/CB_OFF /"
+          done
       - name: Compare output with main build
         if: inputs.modes == ''
         run: |

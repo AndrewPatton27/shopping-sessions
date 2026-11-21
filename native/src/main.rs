@@ -1071,7 +1071,7 @@ unsafe fn event_row(
 #[inline(always)]
 unsafe fn parse_clicks_w<const W: bool>(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u64, out: &mut Parts<CRec>) {
     let mut ord = task << 32;
-    if W {
+    if W && std::env::var_os("NO_CBATCH").is_none() {
         // AVX-512: as for events, 16 rows at a time
         let mut bt = CBatch16 { f: [[(0, 0); 4]; 16], ca: [0; 16], cn: [0; 16], ua: [0; 16], un: [0; 16], ta: [0; 16], tn: [0; 16], cnt: 0 };
         scan_w::<4, W>(base, lo, hi, |f| {
