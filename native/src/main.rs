@@ -466,16 +466,18 @@ struct Ck {
     ok: u32,
 }
 
-/// Dedup record. `r` = (chunk number << 32 | row in chunk) is the read order;
-/// `loc` = (thread << 48 | partition << 32 | index) is where the copy's payload
-/// row sits, or NOLOC for a copy that failed validation (it has no payload).
+/// Dedup record; the copy with the smallest (ord, loc) wins. `loc` =
+/// (thread << 48 | partition << 32 | index) is where the copy's payload row
+/// sits, or NOLOC for a copy that failed validation (it has no payload).
+/// Events: ord = ingest_ts. Copies with equal ingest_ts are identical, so the
+/// loc tie-break picks any one. Clicks: ord = read order (chunk << 32 | row),
+/// which keeps the first copy read.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct DRec {
     k0: u64,
     k1: u64,
-    ing: i64,
-    r: u64,
+    ord: i64,
     loc: u64,
 }
 
@@ -570,9 +572,9 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 const RING: usize = 16;
 
 #[inline(always)]
-fn push_d(d: &mut [Vec<DRec>], bits: u32, key: u128, ing: i64, r: u64, loc: u64) {
+fn push_d(d: &mut [Vec<DRec>], bits: u32, key: u128, ord: i64, loc: u64) {
     let p = part_of(hk(key), bits);
-    unsafe { d.get_unchecked_mut(p) }.push(DRec { k0: (key >> 64) as u64, k1: key as u64, ing, r, loc });
+    unsafe { d.get_unchecked_mut(p) }.push(DRec { k0: (key >> 64) as u64, k1: key as u64, ord, loc });
 }
 
 /// Person of user `u` (hash `h`) and the person's partition.
@@ -590,7 +592,6 @@ struct PendE {
     h: u64,
     ts: i64,
     ing: i64,
-    r: u64,
     price: u32,
     cat: u32,
 }
@@ -601,15 +602,14 @@ fn emit_e(cfg: &Cfg, links: &Links, t: u64, p: &PendE, out: &mut POut) {
     let v = unsafe { out.pe.get_unchecked_mut(q) };
     let loc = (t << 48) | ((q as u64) << 32) | v.len() as u64;
     v.push(Ev { u: person, ts: p.ts, price: p.price, cat: p.cat });
-    push_d(&mut out.de, cfg.pe_bits, p.eid, p.ing, p.r, loc);
+    push_d(&mut out.de, cfg.pe_bits, p.eid, p.ing, loc);
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn parse_events(cfg: &Cfg, links: Option<&Links>, t: u64, base: *const u8, lo: usize, hi: usize, slot: usize, out: &mut POut) {
+unsafe fn parse_events(cfg: &Cfg, links: Option<&Links>, t: u64, base: *const u8, lo: usize, hi: usize, out: &mut POut) {
     let (ws, we) = (cfg.ws, cfg.we);
     let mut ring = [PendE::default(); RING];
     let mut k = 0usize;
-    let mut r = (slot as u64) << 32;
     scan_lines::<7>(base, lo, hi, |f| {
         let (a, b) = f[0];
         if a == b {
@@ -617,8 +617,6 @@ unsafe fn parse_events(cfg: &Cfg, links: Option<&Links>, t: u64, base: *const u8
         }
         let eid = eq_key(base.add(a), b - a);
         let ing = cfg.cal.parse(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX);
-        let rr = r;
-        r += 1;
         'v: {
             let (ua, ub) = f[1];
             let (pa, pb) = f[5];
@@ -649,7 +647,7 @@ unsafe fn parse_events(cfg: &Cfg, links: Option<&Links>, t: u64, base: *const u8
             }
             let u = id_key(base.add(ua), ub - ua);
             let h = hk(u);
-            let pend = PendE { u, eid, h, ts, ing, r: rr, price, cat };
+            let pend = PendE { u, eid, h, ts, ing, price, cat };
             let Some(links) = links else {
                 out.qe.push(pend);
                 return;
@@ -663,7 +661,7 @@ unsafe fn parse_events(cfg: &Cfg, links: Option<&Links>, t: u64, base: *const u8
             k += 1;
             return;
         }
-        push_d(&mut out.de, cfg.pe_bits, eid, ing, rr, NOLOC);
+        push_d(&mut out.de, cfg.pe_bits, eid, ing, NOLOC);
     });
     if let Some(links) = links {
         for j in k.saturating_sub(RING)..k {
@@ -688,7 +686,7 @@ fn emit_c(cfg: &Cfg, links: &Links, t: u64, p: &PendC, out: &mut POut) {
     let v = unsafe { out.pc.get_unchecked_mut(q) };
     let loc = (t << 48) | ((q as u64) << 32) | v.len() as u64;
     v.push(Ck { u: person, cid: p.cid, ts: p.ts, camp: p.camp, ok: 1 });
-    push_d(&mut out.dc, cfg.pc_bits, p.cid, 0, p.r, loc);
+    push_d(&mut out.dc, cfg.pc_bits, p.cid, p.r as i64, loc);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -735,7 +733,7 @@ unsafe fn parse_clicks(cfg: &Cfg, links: Option<&Links>, t: u64, base: *const u8
             k += 1;
             return;
         }
-        push_d(&mut out.dc, cfg.pc_bits, cid, 0, rr, NOLOC);
+        push_d(&mut out.dc, cfg.pc_bits, cid, rr as i64, NOLOC);
     });
     if let Some(links) = links {
         for j in k.saturating_sub(RING)..k {
@@ -890,14 +888,14 @@ fn build_links(parts: &[Vec<(u128, u128)>]) -> Links {
 
 // ------------------------------------------------------------------ stage B
 
-/// Calls `kill(loc)` for every copy but the smallest (ing, read order) of each
+/// Calls `kill(loc)` for every copy but the smallest (ord, loc) of each
 /// key in partition `p` of the per-thread record lists `lists`.
 fn dedup_part(lists: &[&Vec<Vec<DRec>>], p: usize, tab: &mut Vec<u64>, kill: impl Fn(u64)) {
     let n: usize = lists.iter().map(|l| l[p].len()).sum();
     if n < 2 {
         return;
     }
-    let cap = (n * 2).next_power_of_two();
+    let cap = (n + n / 2).next_power_of_two();
     let mask = cap - 1;
     if tab.len() < cap {
         tab.resize(cap, 0);
@@ -921,7 +919,7 @@ fn dedup_part(lists: &[&Vec<Vec<DRec>>], p: usize, tab: &mut Vec<u64>, kill: imp
                 if s >> 40 == tag {
                     let o = &lists[((s >> 32) & 0xFF) as usize][p][s as u32 as usize];
                     if o.k0 == r.k0 && o.k1 == r.k1 {
-                        if (r.ing, r.r) < (o.ing, o.r) {
+                        if (r.ord, r.loc) < (o.ord, o.loc) {
                             kill(o.loc);
                             unsafe { *tab.get_unchecked_mut(j) = new };
                         } else {
@@ -1581,7 +1579,7 @@ fn main() {
                         let lk = links.get();
                         unsafe {
                             match tk.kind {
-                                Kind::Events => parse_events(cfg, lk, t as u64, base, lo, hi, tk.slot, &mut out),
+                                Kind::Events => parse_events(cfg, lk, t as u64, base, lo, hi, &mut out),
                                 Kind::Clicks => parse_clicks(cfg, lk, t as u64, base, lo, hi, tk.slot, &mut out),
                             }
                         }
