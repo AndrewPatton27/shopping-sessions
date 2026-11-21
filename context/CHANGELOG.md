@@ -39,3 +39,5 @@
 - 2026-11-21: Linux CI baseline (bench run 44905339033, 4 threads, 10M official-gen): internal total ~650-684 ms (parse ~360, person ~145, sessions+write ~125), wall 0.77 s -> ~100 ms outside timer (exit/teardown?). Peak RSS 1.48 GB. Run-to-run spread ~3%: usable for A/B.
 - 2026-11-21: exp-mmap rejected (MATCH but no gain). CI runner variance across runs ~60%: only same-run A/B counts.
 - 2026-11-21: Opus exp-direct merged (25f155d): no person stage (link table built in parallel, rows mapped on parse), std-only huge-page allocator, word-parallel timestamps, 32 B dedup records. Same-run CI: total -13..18%, wall -24% (0.57-0.61 vs ~0.77). Lead verify: full+META+FUZZ PASS, 60M MATCH Polars (7.85 s local). Docker CI green.
+- 2026-11-21: BB-BB75F2BE scored 1.43 s (rank 134/258). Scorer gain 10% vs CI 24% -> scorer bottleneck differs (suspect memory bandwidth contention: 14 concurrent workers; or I/O).
+- 2026-11-21: Opus round 2: cold cache reproduces scorer's smaller gain; memory-traffic cuts no CI effect. Merged exp-io (fadvise WILLNEED prefetch, Linux-only; scorer-emulation bench modes). Verify FUZZ PASS. Submitting as cold-disk probe.
