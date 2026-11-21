@@ -536,7 +536,7 @@ unsafe impl<T> Sync for Ptr<T> {}
 /// One thread's rows, partitioned: partition p fills buf[start[p]..end[p]),
 /// then spills to over[p].
 ///
-/// With staging on, rows first collect in a cache-resident 192 B line group
+/// With staging (on when the buffer base allows 64 B aligned regions), rows first collect in a cache-resident 192 B line group
 /// per partition; a full group goes to buf with non-temporal stores (no read
 /// for ownership of the destination lines, no cache pollution). Regions start
 /// 64 B aligned and advance by whole groups. `flush` drains partial groups
@@ -565,27 +565,17 @@ impl<T: Copy> Parts<T> {
     fn new(np: usize, per: usize) -> Parts<T> {
         const { assert!(STAGE % std::mem::size_of::<T>() == 0 && STAGE / std::mem::size_of::<T>() < 256) };
         let k = Self::K;
-        let per = per.min((u32::MAX as usize - 1) / np.max(1) - k);
-        let mut stage = Vec::new();
+        let per = per.min((u32::MAX as usize - 1) / np.max(1) - 2 * k);
+        let per = per.div_ceil(k) * k;
+        let buf: Vec<T> = Vec::with_capacity(np * per + k);
+        // first region 64 B aligned when the base allows; else no staging
+        let base = buf.as_ptr() as usize;
         let mut shift = 0usize;
-        let mut per = per;
-        let buf: Vec<T>;
-        if *KN {
-            per = per.div_ceil(k) * k;
-            buf = Vec::with_capacity(np * per + k);
-            let base = buf.as_ptr() as usize;
-            let sz = std::mem::size_of::<T>();
-            while shift < k && (base + shift * sz) % 64 != 0 {
-                shift += 1;
-            }
-            if shift < k {
-                stage = vec![Stage([0; STAGE]); np];
-            } else {
-                shift = 0;
-            }
-        } else {
-            buf = Vec::with_capacity(np * per);
+        while shift < k && (base + shift * std::mem::size_of::<T>()) % 64 != 0 {
+            shift += 1;
         }
+        let stage = if shift < k { vec![Stage([0; STAGE]); np] } else { Vec::new() };
+        let shift = shift % k;
         Parts {
             buf,
             ce: (0..np).map(|p| ((shift + p * per) as u32, (shift + (p + 1) * per) as u32)).collect(),
@@ -1412,10 +1402,8 @@ struct CBufs {
     csegs: Vec<(Ptr<PCk>, usize)>,
 }
 
-static KN: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('n'));
-static KNOBS: LazyLock<String> = LazyLock::new(|| std::env::var("KNOBS").unwrap_or_default());
-static KRT: LazyLock<usize> = LazyLock::new(|| if KNOBS.contains('r') { 256 } else if KNOBS.contains('R') { 1024 } else if KNOBS.contains('s') { 96 } else { usize::MAX });
-static KQ: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('q'));
+/// Persons with at least this many events sort them by radix.
+const RADIX_MIN: usize = 256;
 
 /// Sorts v by its high 32 bits (ts): LSD radix, 11 bits per pass over ts - min.
 fn radix_ts(v: &mut [u64], tmp: &mut Vec<u64>) {
@@ -1556,7 +1544,7 @@ unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut
         let ee = b.off[p] as usize;
         let evs = &mut b.evs[es..ee];
         es = ee;
-        if evs.len() >= *KRT {
+        if evs.len() >= RADIX_MIN {
             radix_ts(evs, &mut b.tmp);
         } else if evs.len() > 1 {
             evs.sort_unstable();
@@ -1566,12 +1554,7 @@ unsafe fn do_part(q: usize, pes: &[Parts<PRec>], pcs: &[Parts<PCk>], local: &mut
             let c = &mut b.cks[cs..ce];
             cs = ce;
             if c.len() > 1 {
-                if *KQ && c.iter().all(|x| x.cid & SLOW == 0) {
-                    // packed keys: integer order is byte-wise order
-                    c.sort_unstable_by_key(|x| ((x.ts as u128) << 64) | x.cid as u128);
-                } else {
-                    c.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| key_cmp(x.cid, y.cid)));
-                }
+                c.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| key_cmp(x.cid, y.cid)));
             }
             c
         } else {
