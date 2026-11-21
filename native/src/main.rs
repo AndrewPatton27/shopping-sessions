@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AO};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Instant;
+use std::mem::MaybeUninit;
 
 use ts::{parse_ts, Cal, DAY_MS};
 
@@ -540,7 +541,14 @@ struct Parts<T: Copy> {
     ce: Vec<(u32, u32)>,
     start: Vec<u32>,
     over: Vec<Vec<T>>,
+    /// software write-combining: one 64 B staging line per partition
+    stage: Vec<Line>,
+    cnt: Vec<u8>,
 }
+
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Line([MaybeUninit<u8>; 64]);
 
 unsafe impl<T: Copy> Send for Parts<T> {}
 unsafe impl<T: Copy> Sync for Parts<T> {}
@@ -554,23 +562,51 @@ impl<T: Copy> Parts<T> {
             ce: (0..np).map(|p| ((p * per) as u32, ((p + 1) * per) as u32)).collect(),
             start: (0..np).map(|p| (p * per) as u32).collect(),
             over: (0..np).map(|_| Vec::new()).collect(),
+            stage: vec![Line([MaybeUninit::uninit(); 64]); np],
+            cnt: vec![0; np],
         }
     }
+    const K: usize = 64 / std::mem::size_of::<T>();
     #[inline(always)]
     fn push(&mut self, p: usize, v: T) {
+        const { assert!(std::mem::size_of::<T>() <= 64 && std::mem::size_of::<T>() > 0) };
         unsafe {
-            let ce = self.ce.get_unchecked_mut(p);
-            if ce.0 < ce.1 {
-                // buf's capacity covers every region; only written slots are read
-                self.buf.as_mut_ptr().add(ce.0 as usize).write(v);
-                ce.0 += 1;
-            } else {
-                self.over.get_unchecked_mut(p).push(v);
+            let c = self.cnt.get_unchecked_mut(p);
+            let slot = self.stage.get_unchecked_mut(p).0.as_mut_ptr() as *mut T;
+            slot.add(*c as usize).write(v);
+            *c += 1;
+            if *c as usize == Self::K {
+                *c = 0;
+                self.drain(p, Self::K);
+            }
+        }
+    }
+    /// Move the first n staged records of partition p to its region (then over).
+    #[inline(always)]
+    unsafe fn drain(&mut self, p: usize, n: usize) {
+        let slot = self.stage.get_unchecked(p).0.as_ptr() as *const T;
+        let ce = self.ce.get_unchecked_mut(p);
+        let room = (ce.1 - ce.0) as usize;
+        let m = n.min(room);
+        // buf's capacity covers every region; only the written slots are read
+        std::ptr::copy_nonoverlapping(slot, self.buf.as_mut_ptr().add(ce.0 as usize), m);
+        ce.0 += m as u32;
+        if m < n {
+            self.over.get_unchecked_mut(p).extend_from_slice(std::slice::from_raw_parts(slot.add(m), n - m));
+        }
+    }
+    /// Write out every partially filled staging line. Required before segs.
+    fn flush(&mut self) {
+        for p in 0..self.cnt.len() {
+            let n = self.cnt[p] as usize;
+            if n > 0 {
+                self.cnt[p] = 0;
+                unsafe { self.drain(p, n) };
             }
         }
     }
     fn len(&self, p: usize) -> usize {
-        (self.ce[p].0 - self.start[p]) as usize + self.over[p].len()
+        (self.ce[p].0 - self.start[p]) as usize + self.over[p].len() + self.cnt[p] as usize
     }
     /// The two written slices of partition p, writable.
     fn segs_mut(&mut self, p: usize, out: &mut Vec<(Ptr<T>, usize)>) {
@@ -1662,6 +1698,8 @@ fn main() {
                             }
                         }
                     }
+                    pe.flush();
+                    pc.flush();
                     (pe, pc)
                 })
             })
@@ -1724,6 +1762,8 @@ fn main() {
                                 }
                             }
                         }
+                        oe.flush();
+                        oc.flush();
                         (oe, oc)
                     })
                 })
