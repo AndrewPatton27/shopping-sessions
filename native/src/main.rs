@@ -89,7 +89,8 @@ fn find_interned(s: &[u8]) -> Option<u64> {
     INTERN.lock().unwrap().map.get(s).map(|&i| SLOW | i as u64)
 }
 
-/// Packed key of an ID of 1..=9 bytes, each in 0x01..=0x7F. Reads 8 bytes at p.
+/// Packed key of an ID of 1..=9 bytes, each in 0x01..=0x7F. Reads 9 bytes at p
+/// whatever len is (8- and 9-byte IDs come mixed: no branch on which).
 #[inline(always)]
 unsafe fn pack7(p: *const u8, len: usize) -> Option<u64> {
     if len.wrapping_sub(1) >= 9 {
@@ -98,7 +99,7 @@ unsafe fn pack7(p: *const u8, len: usize) -> Option<u64> {
     let v = u64::from_be_bytes(std::ptr::read_unaligned(p as *const [u8; 8]));
     let m = !0u64 << (64 - 8 * len.min(8));
     let v = v & m;
-    let b8 = if len == 9 { *p.add(8) as u64 } else { 0 };
+    let b8 = *p.add(8) as u64 & ((len == 9) as u64).wrapping_neg();
     let t = v | (!m & 0x0101_0101_0101_0101);
     let zero = t.wrapping_sub(0x0101_0101_0101_0101) & !t & 0x8080_8080_8080_8080;
     let bad = ((v | b8) & 0x8080_8080_8080_8080) | zero | ((len == 9) & (b8 == 0)) as u64;
@@ -185,39 +186,54 @@ fn prefetch<T>(p: *const T) {
     let _ = p;
 }
 
-/// Small open-addressing map key -> u32 (products, campaigns). Key 0 never occurs.
+/// Small map key -> u32 (products, campaigns). Key 0 never occurs. Buckets of
+/// 4 keys per cache line like `Links`: no branch on probe collisions.
 struct KeyMap {
-    slots: Vec<(u64, u32)>,
-    mask: usize,
+    bk: Vec<Bucket>,
 }
 
 impl KeyMap {
     fn new(n: usize) -> KeyMap {
-        let cap = (n * 2).max(16).next_power_of_two();
-        KeyMap { slots: vec![(0, 0); cap], mask: cap - 1 }
+        KeyMap { bk: vec![Bucket { k: [0; 4], v: [0; 4] }; (n / 2).max(4)] }
     }
+    #[inline(always)]
+    fn home(&self, k: u64) -> usize {
+        ((mix(k) as u128 * self.bk.len() as u128) >> 64) as usize
+    }
+    /// Inserts or overwrites.
     fn insert(&mut self, k: u64, v: u32) {
-        let mut j = mix(k) as usize & self.mask;
+        let mut b = self.home(k);
         loop {
-            if self.slots[j].0 == 0 || self.slots[j].0 == k {
-                self.slots[j] = (k, v);
-                return;
+            for i in 0..4 {
+                let s = &mut self.bk[b];
+                if s.k[i] == k || s.k[i] == 0 {
+                    s.k[i] = k;
+                    s.v[i] = v as u64;
+                    return;
+                }
             }
-            j = (j + 1) & self.mask;
+            b = (b + 1) % self.bk.len();
         }
     }
     #[inline(always)]
     fn get(&self, k: u64) -> Option<u32> {
-        let mut j = mix(k) as usize & self.mask;
+        let mut b = self.home(k);
         loop {
-            let s = unsafe { self.slots.get_unchecked(j) };
-            if s.0 == k {
-                return Some(s.1);
+            let bk = unsafe { self.bk.get_unchecked(b) };
+            let mut m = 0u32;
+            let mut z = 0u32;
+            for i in 0..4 {
+                m |= ((bk.k[i] == k) as u32) << i;
+                z |= ((bk.k[i] == 0) as u32) << i;
             }
-            if s.0 == 0 {
-                return None;
+            if (m | z) != 0 {
+                let v = bk.v[(m.trailing_zeros() & 3) as usize] as u32;
+                return if m != 0 { Some(v) } else { None };
             }
-            j = (j + 1) & self.mask;
+            b += 1;
+            if b == self.bk.len() {
+                b = 0;
+            }
         }
     }
 }
@@ -605,6 +621,26 @@ impl<T: Copy> Parts<T> {
                 ce.0 += 1;
             } else {
                 self.over.get_unchecked_mut(p).push(v);
+            }
+        }
+    }
+    /// push when live, without branching on live where staging is on (the
+    /// slot is written either way; only a live row advances the count).
+    #[inline(always)]
+    fn push_if(&mut self, p: usize, v: T, live: bool) {
+        if self.stage.is_empty() {
+            if live {
+                self.push(p, v);
+            }
+            return;
+        }
+        unsafe {
+            let c = self.cnt.get_unchecked_mut(p);
+            (self.stage.get_unchecked_mut(p).0.as_mut_ptr() as *mut T).add(*c as usize).write(v);
+            *c += live as u8;
+            if *c as usize == Self::K {
+                *c = 0;
+                self.group(p);
             }
         }
     }
@@ -1092,11 +1128,8 @@ unsafe fn route_ev(segs: &[(Ptr<ERec>, usize)], links: &Links, qb: u32, out: &mu
                 links.prefetch(mix((*p.add(i + LOOK)).user));
             }
             let r = *p.add(i);
-            if r.ts == DEAD {
-                continue;
-            }
             let person = links.lookup(r.user, mix(r.user));
-            out.push(part_of(mix(person), qb), PRec { person, key: ((r.ts as u64) << 32) | r.pc as u64 });
+            out.push_if(part_of(mix(person), qb), PRec { person, key: ((r.ts as u64) << 32) | r.pc as u64 }, r.ts != DEAD);
         }
     }
 }
@@ -1109,11 +1142,8 @@ unsafe fn route_ck(segs: &[(Ptr<CRec>, usize)], links: &Links, qb: u32, out: &mu
                 links.prefetch(mix((*p.add(i + LOOK)).user));
             }
             let r = *p.add(i);
-            if r.camp == DEAD {
-                continue;
-            }
             let person = links.lookup(r.user, mix(r.user));
-            out.push(part_of(mix(person), qb), PCk { person, cid: r.cid, ts: r.ts, camp: r.camp });
+            out.push_if(part_of(mix(person), qb), PCk { person, cid: r.cid, ts: r.ts, camp: r.camp }, r.camp != DEAD);
         }
     }
 }
@@ -1404,6 +1434,7 @@ struct CBufs {
 
 /// Persons with at least this many events sort them by radix.
 const RADIX_MIN: usize = 256;
+
 
 /// Sorts v by its high 32 bits (ts): LSD radix, 11 bits per pass over ts - min.
 fn radix_ts(v: &mut [u64], tmp: &mut Vec<u64>) {
