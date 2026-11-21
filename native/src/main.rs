@@ -483,13 +483,15 @@ struct ERec {
     pc: u32,
 }
 
-/// Stage A click row (valid clicks only). ts: ms since window_start - 7 days.
-/// camp: campaign index, DEAD after dedup for a repeated copy.
+/// Stage A click row. ord: read order (task << 32 | row), the first copy read
+/// wins. ts: ms since window_start - 7 days. camp: campaign index, DEAD for an
+/// invalid click or, after dedup, a repeated copy.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct CRec {
     cid: u64,
     user: u64,
+    ord: u64,
     ts: u32,
     camp: u32,
 }
@@ -646,12 +648,9 @@ unsafe fn rd32(p: *const u8) -> u32 {
     std::ptr::read_unaligned(p as *const u32)
 }
 
-static EXP: LazyLock<u32> = LazyLock::new(|| std::env::var("EXP").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
 unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
     let (ws, we) = (cfg.ws, cfg.we);
-    let exp = *EXP;
-    if exp == 3 { return; }
-    if exp == 2 { let mut x = 0usize; scan::<7>(base, lo, hi, |f| { x = x.wrapping_add(f[0].0 ^ f[6].1); }); std::hint::black_box(x); return; }
+
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
@@ -660,8 +659,8 @@ unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &m
         if a == b {
             return;
         }
-        let eid = if exp == 8 { (a as u64) | 1 } else { key_of(base.add(a), b - a) };
-        let ing = if exp == 6 { 1 } else { cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX) };
+        let eid = key_of(base.add(a), b - a);
+        let ing = cfg.cal.f1_trusted(base.add(f[3].0), f[3].1 - f[3].0).unwrap_or(i64::MAX);
         let mut r = ERec { eid, user: 0, ing, ts: DEAD, pc: 0 };
         'v: {
             let (ua, ub) = f[1];
@@ -676,10 +675,10 @@ unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &m
             if !purchase & !((tl == 4) & ((w == VIEW) | (w == CART))) {
                 break 'v;
             }
-            let ts = if exp == 7 { ws + (ua as i64 & 0xFFFFF) } else { match cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0) {
+            let ts = match cfg.cal.parse(base.add(f[2].0), f[2].1 - f[2].0) {
                 Some(t) if t >= ws && t < we => t,
                 _ => break 'v,
-            } };
+            };
             if ing.saturating_sub(ts) > DAY_MS {
                 break 'v;
             }
@@ -691,37 +690,44 @@ unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &m
                 let cat = key_find(base.add(pa), pb - pa).and_then(|k| cfg.products.get(k)).unwrap_or(cfg.unknown_cat);
                 r.pc = (price << 8) | cat;
             }
-            r.user = if exp == 8 { ua as u64 | 1 } else { key_of(base.add(ua), ub - ua) };
+            r.user = key_of(base.add(ua), ub - ua);
             r.ts = (ts - ws) as u32;
         }
-        if exp == 1 || exp >= 6 { std::hint::black_box(r); return; }
-        if exp == 4 { out.push(0, r); return; }
         out.push(part_of(mix(eid), cfg.pe_bits), r);
     });
 }
 
-/// Invalid clicks are dropped here: copies of a click have identical values,
-/// so every copy of an invalid click is invalid.
-unsafe fn parse_clicks(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<CRec>) {
+/// Invalid clicks are kept (camp DEAD): dedup comes before validation.
+unsafe fn parse_clicks(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u64, out: &mut Parts<CRec>) {
     let (cs, we) = (cfg.ws - WEEK_MS, cfg.we);
+    let mut ord = task << 32;
     scan::<4>(base, lo, hi, |f| {
         let (a, b) = f[0];
-        let (ua, ub) = f[1];
-        let (ca, cb) = f[2];
-        if a == b || ua == ub || ca == cb {
+        if a == b {
             return;
         }
-        let camp = match key_find(base.add(ca), cb - ca).and_then(|k| cfg.campaigns.get(k)) {
-            Some(c) => c,
-            None => return,
-        };
-        let ts = match cfg.cal.parse(base.add(f[3].0), f[3].1 - f[3].0) {
-            Some(t) if t >= cs && t < we => t,
-            _ => return,
-        };
         let cid = key_of(base.add(a), b - a);
-        let user = key_of(base.add(ua), ub - ua);
-        out.push(part_of(mix(cid), cfg.pc_bits), CRec { cid, user, ts: (ts - cs) as u32, camp });
+        let mut r = CRec { cid, user: 0, ord, ts: 0, camp: DEAD };
+        ord += 1;
+        'v: {
+            let (ua, ub) = f[1];
+            let (ca, cb) = f[2];
+            if ua == ub || ca == cb {
+                break 'v;
+            }
+            let camp = match key_find(base.add(ca), cb - ca).and_then(|k| cfg.campaigns.get(k)) {
+                Some(c) => c,
+                None => break 'v,
+            };
+            let ts = match cfg.cal.parse(base.add(f[3].0), f[3].1 - f[3].0) {
+                Some(t) if t >= cs && t < we => t,
+                _ => break 'v,
+            };
+            r.user = key_of(base.add(ua), ub - ua);
+            r.ts = (ts - cs) as u32;
+            r.camp = camp;
+        }
+        out.push(part_of(mix(cid), cfg.pc_bits), r);
     });
 }
 
@@ -924,7 +930,7 @@ unsafe fn dedup_ev(segs: &[(Ptr<ERec>, usize)], tab: &mut Vec<u64>) {
     }
 }
 
-/// Marks every copy of a click but the first DEAD.
+/// Marks every copy of a click but the first read DEAD.
 unsafe fn dedup_ck(segs: &[(Ptr<CRec>, usize)], tab: &mut Vec<u64>) {
     let n: usize = segs.iter().map(|s| s.1).sum();
     if n < 2 {
@@ -951,7 +957,12 @@ unsafe fn dedup_ck(segs: &[(Ptr<CRec>, usize)], tab: &mut Vec<u64>) {
                 if s >> 40 == tag {
                     let o = segs.get_unchecked(((s >> 28) & 0xFFF) as usize).0 .0.add((s & 0x0FFF_FFFF) as usize);
                     if (*o).cid == cid {
-                        (*r).camp = DEAD;
+                        if (*r).ord < (*o).ord {
+                            (*o).camp = DEAD;
+                            *t.add(j) = new;
+                        } else {
+                            (*r).camp = DEAD;
+                        }
                         break;
                     }
                 }
@@ -1647,7 +1658,7 @@ fn main() {
                         unsafe {
                             match tk.kind {
                                 Kind::Events => parse_events(cfg, base, lo, hi, &mut pe),
-                                Kind::Clicks => parse_clicks(cfg, base, lo, hi, &mut pc),
+                                Kind::Clicks => parse_clicks(cfg, base, lo, hi, i as u64, &mut pc),
                             }
                         }
                     }
