@@ -9,3 +9,4 @@ __pycache__/
 *.pyc
 native/target/
 .claude/logs/
+bench/verify.log

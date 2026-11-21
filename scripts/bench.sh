@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Usage: bash scripts/bench.sh NAME [DATA_DIR]
-# Env: PIPE (command under test, default "python pipeline/pipeline.py"), RUNS (default 3)
+# Env: PIPE (command under test, default "python pipeline/pipeline.py"), RUNS (default 3), NOTE (free text, last column)
+# Only one timing run at a time per machine: waits on $STRESS/.bench.lock.
 # Run from repo root. Appends one row to bench/results.tsv.
 set -u
 
@@ -12,9 +13,20 @@ BIG=../../stress/big
 REF=../../stress/bigref
 OUT_ROOT=../../stress/bench-out/$NAME-$(date -u +%Y%m%dT%H%M%S)
 RESULTS=bench/results.tsv
+NOTE=${NOTE:-}
+LOCK=../../stress/.bench.lock
 
 abspath() { (cd "$1" && pwd -W 2>/dev/null || pwd); }
 fmt() { local c=$(( ($1 + 5) / 10 )); printf '%d.%02d' $((c / 100)) $((c % 100)); }
+
+mkdir -p "$(dirname "$LOCK")"
+waited=0
+until mkdir "$LOCK" 2>/dev/null; do
+  [ "$waited" = 0 ] && echo "waiting for bench lock" >&2
+  waited=1
+  sleep 5
+done
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
 mkdir -p "$OUT_ROOT"
 times=()
@@ -61,6 +73,6 @@ if [ ! -f "$RESULTS" ]; then
 fi
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
   "$ts" "$NAME" "$commit" "$dirty" "$dataset" "$RUNS" \
-  "$(fmt "$med")" "$(fmt "$min")" "$(fmt "$max")" "$tag" "$PIPE" >> "$RESULTS"
+  "$(fmt "$med")" "$(fmt "$min")" "$(fmt "$max")" "$tag" "$PIPE" "$NOTE" >> "$RESULTS"
 
 echo "BENCH $NAME median=$(fmt "$med")s min=$(fmt "$min")s max=$(fmt "$max")s correct=$tag"

@@ -18,3 +18,6 @@
 - 2026-11-21: Merged video batches 0-5 themes into best-practices.md; added research-testing.md, research-optimization-loop.md, research-engine-options.md, drafts/ (agents, hooks; not installed). Rules audit still running.
 - 2026-11-21: Added context/FAILURES.md (best-practices §8: log and cluster agent failures).
 - 2026-11-21: Sonnet perf round 1 verified by lead (36/36, MATCH x3, dev MATCH): 2M ~7.7 s -> ~5.85 s (noisy). Committed.
+- 2026-11-21: Read review-rules-audit.md (3 confirmed bugs, latent); sent fixes to Sonnet round 2 ahead of perf.
+- 2026-11-21: Fresh Opus reviewer: confirmed SHIFT overflow + new CR_MARK byte-order bug (x\r vs x\x10). Forwarded to Sonnet; fix must keep \r intact.
+- 2026-11-21: Test kit committed: oracle sha256 guard, official dev holdout, invariants (check_inv.py), metamorphic (meta.py), FAST/META modes, verify.log, bench lock.

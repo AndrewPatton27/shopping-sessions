@@ -13,3 +13,4 @@ Format: date | who | what failed | root cause | fix / rule
 
 ## Agent process
 - 2026-11-21 | haiku | verify.sh hid pipeline stderr on crash | brief said /dev/null | briefs must say where failure detail goes (log tail on FAIL)
+- 2026-11-21 | other session audit | packed key SHIFT=2^31 overflows for windows >17.9 d; \x1e/\x1f bytes break CR_MARK/separator | fixed-width bit packing and sentinel bytes assumed, not derived | derive widths from data; choose sentinels proven absent (assigned to Sonnet round 2)
