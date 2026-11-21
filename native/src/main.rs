@@ -540,19 +540,60 @@ impl<T> Copy for Ptr<T> {}
 unsafe impl<T> Send for Ptr<T> {}
 unsafe impl<T> Sync for Ptr<T> {}
 
-/// One thread's rows, partitioned: partition p fills buf[start[p]..end[p]),
-/// then spills to over[p].
-///
-/// With staging (on when the buffer base allows 64 B aligned regions), rows first collect in a cache-resident 192 B line group
-/// per partition; a full group goes to buf with non-temporal stores (no read
-/// for ownership of the destination lines, no cache pollution). Regions start
-/// 64 B aligned and advance by whole groups. `flush` drains partial groups
-/// and must run before the rows are read, on the writing thread.
+/// Bytes per arena chunk: whole 192 B stage groups, and whole records of
+/// every row type (16, 24, 32 B).
+const CH: usize = 128 * STAGE;
+
+/// One thread's chunk source: chunks it has freed first (rows already
+/// consumed), else fresh 64 B aligned chunks carved from big slabs. Reusing
+/// consumed chunks spares the kernel zeroing fresh pages, and handing out
+/// chunks on demand replaces per-partition regions sized with headroom.
+/// Slabs are never freed (the process exits without destructors).
+struct Arena {
+    free: Vec<*mut u8>,
+    next: *mut u8,
+    left: usize,
+    slab: usize,
+}
+
+impl Arena {
+    /// A leaked arena (Parts keep a pointer to it across threads; only the
+    /// thread that pushes uses it).
+    fn leak(slab: usize) -> *mut Arena {
+        let slab = slab.div_ceil(CH).max(16) * CH;
+        Box::into_raw(Box::new(Arena { free: Vec::new(), next: std::ptr::null_mut(), left: 0, slab }))
+    }
+    #[inline]
+    fn get(&mut self) -> *mut u8 {
+        if let Some(c) = self.free.pop() {
+            return c;
+        }
+        if self.left < CH {
+            let mut v: Vec<u8> = Vec::with_capacity(self.slab + 64);
+            let p = v.as_mut_ptr();
+            std::mem::forget(v);
+            let off = p.align_offset(64);
+            self.next = unsafe { p.add(off) };
+            self.left = self.slab;
+        }
+        let c = self.next;
+        self.next = unsafe { c.add(CH) };
+        self.left -= CH;
+        c
+    }
+}
+
+/// One thread's rows, partitioned: each partition is a list of full arena
+/// chunks plus the current one. Rows first collect in a cache-resident 192 B
+/// stage group per partition; a full group goes to the chunk with
+/// non-temporal stores (no read for ownership of the destination lines, no
+/// cache pollution). `flush` drains partial groups and must run before the
+/// rows are read, on the writing thread.
 struct Parts<T: Copy> {
-    buf: Vec<T>,
-    ce: Vec<(u32, u32)>,
-    start: Vec<u32>,
-    over: Vec<Vec<T>>,
+    arena: *mut Arena,
+    full: Vec<Vec<*mut T>>,
+    cur: Vec<*mut T>,
+    fill: Vec<u32>,
     stage: Vec<Stage>,
     cnt: Vec<u8>,
 }
@@ -568,83 +609,65 @@ unsafe impl<T: Copy> Sync for Parts<T> {}
 
 impl<T: Copy> Parts<T> {
     const K: usize = STAGE / std::mem::size_of::<T>();
+    const CAP: usize = CH / std::mem::size_of::<T>();
 
-    fn new(np: usize, per: usize) -> Parts<T> {
+    fn new(np: usize, arena: *mut Arena) -> Parts<T> {
         const { assert!(STAGE % std::mem::size_of::<T>() == 0 && STAGE / std::mem::size_of::<T>() < 256) };
-        let k = Self::K;
-        let per = per.min((u32::MAX as usize - 1) / np.max(1) - 2 * k);
-        let per = per.div_ceil(k) * k;
-        let buf: Vec<T> = Vec::with_capacity(np * per + k);
-        // first region 64 B aligned when the base allows; else no staging
-        let base = buf.as_ptr() as usize;
-        let mut shift = 0usize;
-        while shift < k && (base + shift * std::mem::size_of::<T>()) % 64 != 0 {
-            shift += 1;
-        }
-        let stage = if shift < k { vec![Stage([0; STAGE]); np] } else { Vec::new() };
-        let shift = shift % k;
         Parts {
-            buf,
-            ce: (0..np).map(|p| ((shift + p * per) as u32, (shift + (p + 1) * per) as u32)).collect(),
-            start: (0..np).map(|p| (shift + p * per) as u32).collect(),
-            over: (0..np).map(|_| Vec::new()).collect(),
-            cnt: vec![0; if stage.is_empty() { 0 } else { np }],
-            stage,
+            arena,
+            full: (0..np).map(|_| Vec::new()).collect(),
+            cur: vec![std::ptr::null_mut(); np],
+            fill: vec![Self::CAP as u32; np],
+            stage: vec![Stage([0; STAGE]); np],
+            cnt: vec![0; np],
         }
     }
     #[inline(always)]
     fn push(&mut self, p: usize, v: T) {
         unsafe {
-            if !self.stage.is_empty() {
-                let c = self.cnt.get_unchecked_mut(p);
-                (self.stage.get_unchecked_mut(p).0.as_mut_ptr() as *mut T).add(*c as usize).write(v);
-                *c += 1;
-                if *c as usize == Self::K {
-                    *c = 0;
-                    self.group(p);
-                }
-                return;
-            }
-            let ce = self.ce.get_unchecked_mut(p);
-            if ce.0 < ce.1 {
-                // buf's capacity covers every region; only written slots are read
-                self.buf.as_mut_ptr().add(ce.0 as usize).write(v);
-                ce.0 += 1;
-            } else {
-                self.over.get_unchecked_mut(p).push(v);
+            let c = self.cnt.get_unchecked_mut(p);
+            (self.stage.get_unchecked_mut(p).0.as_mut_ptr() as *mut T).add(*c as usize).write(v);
+            *c += 1;
+            if *c as usize == Self::K {
+                *c = 0;
+                self.group(p);
             }
         }
     }
-    /// Moves partition p's full stage group to its region (or spills it).
+    /// Room for n more rows in partition p's current chunk (a new chunk if not).
+    #[inline(always)]
+    unsafe fn room(&mut self, p: usize, n: usize) -> *mut T {
+        if *self.fill.get_unchecked(p) as usize + n > Self::CAP {
+            self.new_chunk(p);
+        }
+        let f = self.fill.get_unchecked_mut(p);
+        let d = self.cur.get_unchecked(p).add(*f as usize);
+        *f += n as u32;
+        d
+    }
+    #[inline(never)]
+    unsafe fn new_chunk(&mut self, p: usize) {
+        let old = self.cur[p];
+        if !old.is_null() {
+            self.full[p].push(old);
+        }
+        self.cur[p] = (*self.arena).get() as *mut T;
+        self.fill[p] = 0;
+    }
+    /// Moves partition p's full stage group to its chunk.
     #[inline(always)]
     unsafe fn group(&mut self, p: usize) {
-        let k = Self::K;
-        let ce = self.ce.get_unchecked_mut(p);
+        let dst = self.room(p, Self::K) as *mut u8;
         let src = self.stage.get_unchecked(p).0.as_ptr();
-        if (ce.1 - ce.0) as usize >= k {
-            let dst = self.buf.as_mut_ptr().add(ce.0 as usize) as *mut u8;
-            #[cfg(target_arch = "x86_64")]
-            {
-                use std::arch::x86_64::*;
-                for i in 0..STAGE / 16 {
-                    _mm_stream_si128(dst.add(16 * i) as *mut __m128i, _mm_load_si128(src.add(16 * i) as *const __m128i));
-                }
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::*;
+            for i in 0..STAGE / 16 {
+                _mm_stream_si128(dst.add(16 * i) as *mut __m128i, _mm_load_si128(src.add(16 * i) as *const __m128i));
             }
-            #[cfg(not(target_arch = "x86_64"))]
-            std::ptr::copy_nonoverlapping(src, dst, STAGE);
-            ce.0 += k as u32;
-        } else {
-            self.drain(p, k);
         }
-    }
-    #[cold]
-    unsafe fn drain(&mut self, p: usize, n: usize) {
-        let src = self.stage.get_unchecked(p).0.as_ptr() as *const T;
-        let ce = self.ce.get_unchecked_mut(p);
-        let m = n.min((ce.1 - ce.0) as usize);
-        std::ptr::copy_nonoverlapping(src, self.buf.as_mut_ptr().add(ce.0 as usize), m);
-        ce.0 += m as u32;
-        self.over.get_unchecked_mut(p).extend_from_slice(std::slice::from_raw_parts(src.add(m), n - m));
+        #[cfg(not(target_arch = "x86_64"))]
+        std::ptr::copy_nonoverlapping(src, dst, STAGE);
     }
     /// Drains the partial stage groups; orders the non-temporal stores.
     fn flush(&mut self) {
@@ -652,7 +675,10 @@ impl<T: Copy> Parts<T> {
             let n = self.cnt[p] as usize;
             if n > 0 {
                 self.cnt[p] = 0;
-                unsafe { self.drain(p, n) };
+                unsafe {
+                    let d = self.room(p, n);
+                    std::ptr::copy_nonoverlapping(self.stage[p].0.as_ptr() as *const T, d, n);
+                }
             }
         }
         #[cfg(target_arch = "x86_64")]
@@ -661,30 +687,17 @@ impl<T: Copy> Parts<T> {
         };
     }
     fn len(&self, p: usize) -> usize {
-        (self.ce[p].0 - self.start[p]) as usize + self.over[p].len()
+        let c = if self.cur[p].is_null() { 0 } else { self.fill[p] as usize };
+        self.full[p].len() * Self::CAP + c + self.cnt[p] as usize
     }
-    /// The two written slices of partition p, writable.
-    fn segs_mut(&mut self, p: usize, out: &mut Vec<(Ptr<T>, usize)>) {
-        let s = self.start[p] as usize;
-        let n = self.ce[p].0 as usize - s;
-        if n > 0 {
-            out.push((Ptr(unsafe { self.buf.as_mut_ptr().add(s) }), n));
-        }
-        let o = &mut self.over[p];
-        if !o.is_empty() {
-            out.push((Ptr(o.as_mut_ptr()), o.len()));
-        }
-    }
-    /// The two written slices of partition p, read-only.
+    /// The written chunks of partition p; each starts at its chunk's base.
     fn segs(&self, p: usize, out: &mut Vec<(Ptr<T>, usize)>) {
-        let s = self.start[p] as usize;
-        let n = self.ce[p].0 as usize - s;
-        if n > 0 {
-            out.push((Ptr(unsafe { self.buf.as_ptr().add(s) as *mut T }), n));
+        for &c in &self.full[p] {
+            out.push((Ptr(c), Self::CAP));
         }
-        let o = &self.over[p];
-        if !o.is_empty() {
-            out.push((Ptr(o.as_ptr() as *mut T), o.len()));
+        let c = self.cur[p];
+        if !c.is_null() && self.fill[p] > 0 {
+            out.push((Ptr(c), self.fill[p] as usize));
         }
     }
 }
@@ -1829,9 +1842,8 @@ fn main() {
     // ---- stage A: parse into id partitions; thread 0 first builds the links
     let links: OnceLock<Links> = OnceLock::new();
     let next = AtomicUsize::new(0);
-    // a thread's share of rows, with headroom; overflow spills
-    let share = |est: u64, np: usize| (est as usize / nt) * 6 / 5 / np + 16;
-    let (per_e, per_c) = (share(est_ev, npe), share(est_ck, npc));
+    // slabs of about half a thread's share of the stage-A rows
+    let slab_a = ((est_ev * 32 + est_ck * 32) as usize / nt).max(1 << 22) / 2;
     let mut pes: Vec<Parts<ERec>> = Vec::with_capacity(nt);
     let mut pcs: Vec<Parts<CRec>> = Vec::with_capacity(nt);
     std::thread::scope(|sc| {
@@ -1853,8 +1865,9 @@ fn main() {
                         }
                         let _ = links.set(build_links(&pairs));
                     }
-                    let mut pe = Parts::<ERec>::new(npe, per_e);
-                    let mut pc = Parts::<CRec>::new(npc, per_c);
+                    let arena = Arena::leak(slab_a);
+                    let mut pe = Parts::<ERec>::new(npe, arena);
+                    let mut pc = Parts::<CRec>::new(npc, arena);
                     loop {
                         let i = next.fetch_add(1, AO::Relaxed);
                         if i >= tasks.len() {
@@ -1897,7 +1910,7 @@ fn main() {
     let mut qes: Vec<Parts<PRec>> = Vec::with_capacity(nt);
     let mut qcs: Vec<Parts<PCk>> = Vec::with_capacity(nt);
     {
-        let (per_qe, per_qc) = (share(est_ev, nq), share(est_ck, nq));
+        let slab_b = ((est_ev * 16 + est_ck * 24) as usize / nt).max(1 << 22) / 4;
         let mut border: Vec<(usize, usize)> = (0..npe)
             .map(|p| (pes.iter().map(|x| x.len(p)).sum::<usize>(), p))
             .chain((0..npc).map(|p| (pcs.iter().map(|x| x.len(p)).sum::<usize>() / 2, npe + p)))
@@ -1905,14 +1918,14 @@ fn main() {
         border.sort_unstable_by(|a, b| b.cmp(a));
         let mut esegs: Vec<Vec<(Ptr<ERec>, usize)>> = vec![Vec::new(); npe];
         let mut csegs: Vec<Vec<(Ptr<CRec>, usize)>> = vec![Vec::new(); npc];
-        for x in pes.iter_mut() {
+        for x in pes.iter() {
             for (p, v) in esegs.iter_mut().enumerate() {
-                x.segs_mut(p, v);
+                x.segs(p, v);
             }
         }
-        for x in pcs.iter_mut() {
+        for x in pcs.iter() {
             for (p, v) in csegs.iter_mut().enumerate() {
-                x.segs_mut(p, v);
+                x.segs(p, v);
             }
         }
         let next = AtomicUsize::new(0);
@@ -1922,8 +1935,11 @@ fn main() {
                 .map(|_| {
                     let (esegs, csegs, next, links, border) = (&esegs, &csegs, &next, &links, &border);
                     sc.spawn(move || {
-                        let mut oe = Parts::<PRec>::new(nq, per_qe);
-                        let mut oc = Parts::<PCk>::new(nq, per_qc);
+                        // outputs go first into chunks of partitions this
+                        // thread has consumed
+                        let arena = Arena::leak(slab_b);
+                        let mut oe = Parts::<PRec>::new(nq, arena);
+                        let mut oc = Parts::<PCk>::new(nq, arena);
                         let mut tab: Vec<u64> = Vec::new();
                         loop {
                             let i = next.fetch_add(1, AO::Relaxed);
@@ -1936,9 +1952,11 @@ fn main() {
                                 if p < npe {
                                     dedup_ev(&esegs[p], &mut tab);
                                     route_ev(&esegs[p], links, qb, &mut oe);
+                                    (*arena).free.extend(esegs[p].iter().map(|s| s.0 .0 as *mut u8));
                                 } else {
                                     dedup_ck(&csegs[p - npe], &mut tab);
                                     route_ck(&csegs[p - npe], links, qb, &mut oc);
+                                    (*arena).free.extend(csegs[p - npe].iter().map(|s| s.0 .0 as *mut u8));
                                 }
                             }
                         }
