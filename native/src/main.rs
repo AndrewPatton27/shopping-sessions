@@ -1,12 +1,13 @@
 //! Shopping Sessions: native pipeline. See README.md for the design.
 //!
 //! Stages (each one parallel over NCPU threads):
-//!   A  parse event/click chunks -> per-chunk payload rows + dedup records
-//!      partitioned by hash(id); one thread builds the link table meanwhile
-//!   B  dedup per partition, marking losing copies dead in the payload
-//!   C  map user -> person, partition surviving rows by hash(person)
-//!   D  per partition: group by person, sort, sessionize, attribute, aggregate
-//!   E  write Parquet (one user_daily file per thread)
+//!   A  thread 0 builds the link table (user -> person) while the others
+//!      parse; each parsed row is mapped to its person at once (rows parsed
+//!      before the table is ready are queued, then mapped) and its payload is
+//!      written to its person's partition, its dedup record to hash(id)'s
+//!   B  dedup per id partition, marking losing copies dead in the payload
+//!   D  per person partition: group by person, sort, sessionize, attribute,
+//!      aggregate; write Parquet (one user_daily file per thread)
 
 mod halloc;
 mod pq;
