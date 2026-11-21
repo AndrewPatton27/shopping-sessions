@@ -36,3 +36,6 @@
 - 2026-11-21: Rust parse speed round: no change beat noise; reverted. Remaining lever: DRec 32->24 B (invasive). Local timing plateau.
 - 2026-11-21: User approved: stripped Co-Authored-By from history (filter-branch, backup branch backup-before-attribution-strip, tree identical), force-pushed, repo PUBLIC, attribution off (.claude/settings.json). Submitted BB-4E5D972D @ 12f18b6 (Rust).
 - 2026-11-21: BB-4E5D972D scored 1.59 s, correct, rank 147/250 (top 0.31 s, 10th 0.64 s). Local 20M estimate ~0.85 s -> Linux/scorer gap to investigate.
+- 2026-11-21: Linux CI baseline (bench run 44905339033, 4 threads, 10M official-gen): internal total ~650-684 ms (parse ~360, person ~145, sessions+write ~125), wall 0.77 s -> ~100 ms outside timer (exit/teardown?). Peak RSS 1.48 GB. Run-to-run spread ~3%: usable for A/B.
+- 2026-11-21: exp-mmap rejected (MATCH but no gain). CI runner variance across runs ~60%: only same-run A/B counts.
+- 2026-11-21: Opus exp-direct merged (25f155d): no person stage (link table built in parallel, rows mapped on parse), std-only huge-page allocator, word-parallel timestamps, 32 B dedup records. Same-run CI: total -13..18%, wall -24% (0.57-0.61 vs ~0.77). Lead verify: full+META+FUZZ PASS, 60M MATCH Polars (7.85 s local). Docker CI green.

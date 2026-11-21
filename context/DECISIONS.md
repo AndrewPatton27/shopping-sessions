@@ -45,3 +45,8 @@ Status: accepted. Native Rust track continues only on Sonnet (plan-covered), if 
 Why: identical output on every check (fixtures, regress, official dev, seeds, metamorphic, 10M vs Polars) and ~8x faster than Polars at 10M (0.9 s vs 7.8 s). Build with x86-64-v3 (AVX2) since scorers are AVX-512 Xeons; AVX2 path verified locally.
 Risks: 37 unsafe blocks (reviewer audit pending); Docker image never built locally; Polars fallback kept as Dockerfile.polars.
 Status: accepted
+
+## D-012 2026-11-21 Target 0.25 s; submit hourly only on standings gain
+Why: user goal. First score 1.59 s (rank 147/250); leaders 0.31-0.64 s.
+Rule: A/B every change on Linux CI bench (same data, output compared with main); merge to main only if outputs match and median is faster beyond spread; submit at most once per hour, only when the CI median predicts a better score than the current best.
+Status: accepted
