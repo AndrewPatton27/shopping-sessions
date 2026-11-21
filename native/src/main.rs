@@ -1070,36 +1070,149 @@ unsafe fn event_row(
 /// Invalid clicks are kept (camp DEAD): dedup comes before validation.
 #[inline(always)]
 unsafe fn parse_clicks_w<const W: bool>(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, task: u64, out: &mut Parts<CRec>) {
-    let (cs, we) = (cfg.ws - WEEK_MS, cfg.we);
     let mut ord = task << 32;
+    if W {
+        // AVX-512: as for events, 16 rows at a time
+        let mut bt = CBatch16 { f: [[(0, 0); 4]; 16], ca: [0; 16], cn: [0; 16], ua: [0; 16], un: [0; 16], ta: [0; 16], tn: [0; 16], cnt: 0 };
+        scan_w::<4, W>(base, lo, hi, |f| {
+            if f[0].0 == f[0].1 {
+                return;
+            }
+            let i = bt.cnt;
+            *bt.f.get_unchecked_mut(i) = *f;
+            *bt.ca.get_unchecked_mut(i) = f[0].0 as u32;
+            *bt.cn.get_unchecked_mut(i) = (f[0].1 - f[0].0) as u32;
+            *bt.ua.get_unchecked_mut(i) = f[1].0 as u32;
+            *bt.un.get_unchecked_mut(i) = (f[1].1 - f[1].0) as u32;
+            *bt.ta.get_unchecked_mut(i) = f[3].0 as u32;
+            *bt.tn.get_unchecked_mut(i) = (f[3].1 - f[3].0) as u32;
+            bt.cnt = i + 1;
+            if i == 15 {
+                bt.run(cfg, base, &mut ord, out);
+            }
+        });
+        if bt.cnt > 0 {
+            bt.run(cfg, base, &mut ord, out);
+        }
+        return;
+    }
     scan_w::<4, W>(base, lo, hi, |f| {
-        let (a, b) = f[0];
-        if a == b {
+        if f[0].0 == f[0].1 {
             return;
         }
-        let cid = key_of(base.add(a), b - a);
-        let mut r = CRec { cid, user: 0, ord, ts: 0, camp: DEAD };
+        click_row(
+            cfg,
+            base,
+            f,
+            key_of(base.add(f[0].0), f[0].1 - f[0].0),
+            ord,
+            || cfg.cal.parse(base.add(f[3].0), f[3].1 - f[3].0),
+            || key_of(base.add(f[1].0), f[1].1 - f[1].0),
+            out,
+        );
         ord += 1;
-        'v: {
-            let (ua, ub) = f[1];
-            let (ca, cb) = f[2];
-            if ua == ub || ca == cb {
-                break 'v;
-            }
-            let camp = match key_find(base.add(ca), cb - ca).and_then(|k| cfg.campaigns.get(k)) {
-                Some(c) => c,
-                None => break 'v,
-            };
-            let ts = match cfg.cal.parse(base.add(f[3].0), f[3].1 - f[3].0) {
-                Some(t) if t >= cs && t < we => t,
-                _ => break 'v,
-            };
-            r.user = key_of(base.add(ua), ub - ua);
-            r.ts = (ts - cs) as u32;
-            r.camp = camp;
-        }
-        out.push(part_of(mix(cid), cfg.pc_bits), r);
     });
+}
+
+/// Up to 16 click rows (non-empty click_id) waiting for the 16-lane parse:
+/// their fields, and the starts and lengths of click_id, user_id and ts.
+struct CBatch16 {
+    f: [[(usize, usize); 4]; 16],
+    ca: [u32; 16],
+    cn: [u32; 16],
+    ua: [u32; 16],
+    un: [u32; 16],
+    ta: [u32; 16],
+    tn: [u32; 16],
+    cnt: usize,
+}
+
+impl CBatch16 {
+    #[inline(always)]
+    unsafe fn run(&mut self, cfg: &Cfg, base: *const u8, ord: &mut u64, out: &mut Parts<CRec>) {
+        let n = self.cnt;
+        self.cnt = 0;
+        // unused lanes repeat lane 0 (readable bytes; results ignored)
+        for i in n..16 {
+            self.ca[i] = self.ca[0];
+            self.cn[i] = self.cn[0];
+            self.ua[i] = self.ua[0];
+            self.un[i] = self.un[0];
+            self.ta[i] = self.ta[0];
+            self.tn[i] = self.tn[0];
+        }
+        let mut tv = [0i64; 16];
+        let mut cv = [0u64; 16];
+        let mut uv = [0u64; 16];
+        let (ts_slow, c_slow, u_slow) = {
+            #[cfg(target_arch = "x86_64")]
+            {
+                (
+                    cfg.cal.parse16(base, &self.ta, &self.tn, false, &mut tv),
+                    pack16(base, &self.ca, &self.cn, &mut cv),
+                    pack16(base, &self.ua, &self.un, &mut uv),
+                )
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                (u16::MAX, u16::MAX, u16::MAX)
+            }
+        };
+        for i in 0..n {
+            let f = &self.f[i];
+            let cid = if (c_slow >> i) & 1 != 0 { key_of(base.add(f[0].0), f[0].1 - f[0].0) } else { cv[i] };
+            let (ts_s, t) = ((ts_slow >> i) & 1 != 0, tv[i]);
+            let (us, u) = ((u_slow >> i) & 1 != 0, uv[i]);
+            click_row(
+                cfg,
+                base,
+                f,
+                cid,
+                *ord,
+                || if ts_s { cfg.cal.parse(base.add(f[3].0), f[3].1 - f[3].0) } else if t == i64::MIN { None } else { Some(t) },
+                || if us { key_of(base.add(f[1].0), f[1].1 - f[1].0) } else { u },
+                out,
+            );
+            *ord += 1;
+        }
+    }
+}
+
+/// One click row with a non-empty click_id, given its key and read order,
+/// its ts parser and its user key (each called only when needed).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn click_row(
+    cfg: &Cfg,
+    base: *const u8,
+    f: &[(usize, usize); 4],
+    cid: u64,
+    ord: u64,
+    ts: impl FnOnce() -> Option<i64>,
+    user: impl FnOnce() -> u64,
+    out: &mut Parts<CRec>,
+) {
+    let (cs, we) = (cfg.ws - WEEK_MS, cfg.we);
+    let mut r = CRec { cid, user: 0, ord, ts: 0, camp: DEAD };
+    'v: {
+        let (ua, ub) = f[1];
+        let (ca, cb) = f[2];
+        if ua == ub || ca == cb {
+            break 'v;
+        }
+        let camp = match key_find(base.add(ca), cb - ca).and_then(|k| cfg.campaigns.get(k)) {
+            Some(c) => c,
+            None => break 'v,
+        };
+        let ts = match ts() {
+            Some(t) if t >= cs && t < we => t,
+            _ => break 'v,
+        };
+        r.user = user();
+        r.ts = (ts - cs) as u32;
+        r.camp = camp;
+    }
+    out.push(part_of(mix(cid), cfg.pc_bits), r);
 }
 
 // ------------------------------------------------------------------ links
