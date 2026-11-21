@@ -1,0 +1,24 @@
+# Run the full local verification suite on Linux with the AVX-512 path active
+# (the dev laptop has no AVX-512, so this is the only place that path is fuzzed).
+name: verify-linux
+on:
+  workflow_dispatch:
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q polars==2.0.0 pyarrow==25.0.1
+      - run: rustup default stable
+      - name: Build native (x86-64-v3)
+        run: cd native && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+      - name: CPU features
+        run: echo "avx512bw=$(grep -c avx512bw /proc/cpuinfo) vbmi2=$(grep -c avx512_vbmi2 /proc/cpuinfo)"
+      - name: Fixtures + regress + seeds + invariants + metamorphic + fuzz
+        run: STRESS=/tmp/stress PIPE=./native/target/release/shopping-sessions META=1 FUZZ=1 bash scripts/verify.sh
+      - name: Extra fuzz seeds
+        run: python scripts/fuzz.py --pipe ./native/target/release/shopping-sessions --seeds 51-400 --workdir /tmp/fuzz
