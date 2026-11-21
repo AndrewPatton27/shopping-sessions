@@ -358,13 +358,40 @@ unsafe fn scan_lines<const NF: usize>(
     }
 }
 
-fn read_range(f: &mut File, from: u64, to: u64, buf: &mut Vec<u8>) {
+/// A read buffer whose bytes stay initialized across chunks: it grows (and
+/// zero-fills) only past its high-water mark, so reusing it for the next
+/// chunk costs no memset. `len` is the logical length.
+struct RBuf {
+    v: Vec<u8>,
+    len: usize,
+}
+
+impl RBuf {
+    fn new(cap: usize) -> RBuf {
+        RBuf { v: vec![0; cap], len: 0 }
+    }
+    #[inline]
+    fn room(&mut self, n: usize) {
+        if self.v.len() < self.len + n {
+            self.v.resize(self.len + n, 0);
+        }
+    }
+    #[inline]
+    fn data(&self) -> &[u8] {
+        &self.v[..self.len]
+    }
+    #[inline]
+    fn as_ptr(&self) -> *const u8 {
+        self.v.as_ptr()
+    }
+}
+
+fn read_range(f: &mut File, from: u64, to: u64, buf: &mut RBuf) {
     let n = (to - from) as usize;
-    let old = buf.len();
-    buf.reserve(n + 128);
+    buf.room(n + 129);
     f.seek(SeekFrom::Start(from)).expect("seek");
-    buf.resize(old + n, 0);
-    f.read_exact(&mut buf[old..]).expect("read");
+    f.read_exact(&mut buf.v[buf.len..buf.len + n]).expect("read");
+    buf.len += n;
 }
 
 #[inline]
@@ -373,9 +400,9 @@ fn find_nl(s: &[u8]) -> Option<usize> {
 }
 
 /// Loads the lines of `f` that start in [s, e) into `buf`, minus the header.
-/// Returns (lo, hi) for scan_lines.
-fn load_chunk(f: &mut File, s: u64, e: u64, fsize: u64, buf: &mut Vec<u8>) -> (usize, usize) {
-    buf.clear();
+/// Returns (lo, hi) for scan_lines; 128 readable bytes follow buf[hi].
+fn load_chunk(f: &mut File, s: u64, e: u64, fsize: u64, buf: &mut RBuf) -> (usize, usize) {
+    buf.len = 0;
     if fsize == 0 || s >= e {
         return (0, 0);
     }
@@ -386,7 +413,7 @@ fn load_chunk(f: &mut File, s: u64, e: u64, fsize: u64, buf: &mut Vec<u8>) -> (u
     let mut lo = 0usize;
     if s > 0 {
         // a line starts after each '\n'; it is ours if it starts before e
-        match find_nl(&buf[..lim]) {
+        match find_nl(&buf.data()[..lim]) {
             Some(i) => lo = i + 1,
             None => return (0, 0),
         }
@@ -394,23 +421,27 @@ fn load_chunk(f: &mut File, s: u64, e: u64, fsize: u64, buf: &mut Vec<u8>) -> (u
     // the last line of the chunk ends at the first '\n' at or after e-1 (or EOF)
     let mut from = lim;
     let hi = loop {
-        if let Some(i) = find_nl(&buf[from..]) {
+        if let Some(i) = find_nl(&buf.data()[from..]) {
             break from + i;
         }
         if rend >= fsize {
-            break buf.len();
+            break buf.len;
         }
-        from = buf.len();
+        from = buf.len;
         let nend = (rend + (rend - rs).max(4096)).min(fsize);
         read_range(f, rend, nend, buf);
         rend = nend;
     };
-    if hi == buf.len() {
-        buf.push(b'\n');
+    if hi == buf.len {
+        buf.room(1);
+        buf.v[hi] = b'\n';
+        buf.len += 1;
     }
-    buf.extend_from_slice(&[0u8; 128]);
+    buf.room(128);
+    let l = buf.len;
+    buf.v[l..l + 128].fill(0);
     if s == 0 {
-        lo = match find_nl(&buf[..hi]) {
+        lo = match find_nl(&buf.data()[..hi]) {
             Some(i) => i + 1,
             None => hi,
         };
@@ -418,7 +449,7 @@ fn load_chunk(f: &mut File, s: u64, e: u64, fsize: u64, buf: &mut Vec<u8>) -> (u
     (lo, hi)
 }
 
-fn load_whole(path: &Path, buf: &mut Vec<u8>) -> (usize, usize) {
+fn load_whole(path: &Path, buf: &mut RBuf) -> (usize, usize) {
     let mut f = File::open(path).unwrap_or_else(|e| panic!("open {}: {}", path.display(), e));
     let size = f.metadata().expect("stat").len();
     load_chunk(&mut f, 0, size, size, buf)
@@ -1423,7 +1454,7 @@ fn main() {
     let we = manifest_ts(&man, "window_end");
 
     // products.csv -> category index; later rows win, like a dict
-    let mut buf = Vec::new();
+    let mut buf = RBuf::new(0);
     let mut cat_names: Vec<Vec<u8>> = Vec::new();
     let mut cat_ix: HashMap<Vec<u8>, u32> = HashMap::new();
     let mut prod_rows: Vec<(u128, u32)> = Vec::new();
@@ -1571,7 +1602,7 @@ fn main() {
                         qe: Vec::new(),
                         qc: Vec::new(),
                     };
-                    let mut buf: Vec<u8> = Vec::with_capacity(CHUNK as usize + 8192);
+                    let mut buf = RBuf::new(CHUNK as usize + 8192);
                     if t == 0 {
                         let mut pairs: Vec<(u128, u128)> = Vec::new();
                         for tk in ltasks {
