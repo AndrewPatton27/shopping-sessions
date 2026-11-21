@@ -820,7 +820,7 @@ unsafe fn rd32(p: *const u8) -> u32 {
 }
 
 /// AVX2 build: event rows take the 8-lane batch.
-const LANES8: bool = cfg!(all(target_arch = "x86_64", target_feature = "avx2"));
+const LANES8: bool = false;
 
 unsafe fn parse_events(cfg: &Cfg, base: *const u8, lo: usize, hi: usize, out: &mut Parts<ERec>) {
     if LANES8 {
