@@ -22,7 +22,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AO};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
 use ts::{parse_ts, Cal, DAY_MS};
@@ -535,6 +535,9 @@ struct POut {
     pc: Vec<Vec<Ck>>,
     de: Vec<Vec<DRec>>,
     dc: Vec<Vec<DRec>>,
+    /// Rows parsed before the link table was ready, routed afterwards.
+    qe: Vec<PendE>,
+    qc: Vec<PendC>,
 }
 
 #[inline(always)]
@@ -602,7 +605,7 @@ fn emit_e(cfg: &Cfg, links: &Links, t: u64, p: &PendE, out: &mut POut) {
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn parse_events(cfg: &Cfg, links: &Links, t: u64, base: *const u8, lo: usize, hi: usize, slot: usize, out: &mut POut) {
+unsafe fn parse_events(cfg: &Cfg, links: Option<&Links>, t: u64, base: *const u8, lo: usize, hi: usize, slot: usize, out: &mut POut) {
     let (ws, we) = (cfg.ws, cfg.we);
     let mut ring = [PendE::default(); RING];
     let mut k = 0usize;
@@ -646,19 +649,26 @@ unsafe fn parse_events(cfg: &Cfg, links: &Links, t: u64, base: *const u8, lo: us
             }
             let u = id_key(base.add(ua), ub - ua);
             let h = hk(u);
+            let pend = PendE { u, eid, h, ts, ing, r: rr, price, cat };
+            let Some(links) = links else {
+                out.qe.push(pend);
+                return;
+            };
             links.prefetch(h);
             let s = k & (RING - 1);
             if k >= RING {
                 emit_e(cfg, links, t, &ring[s], out);
             }
-            ring[s] = PendE { u, eid, h, ts, ing, r: rr, price, cat };
+            ring[s] = pend;
             k += 1;
             return;
         }
         push_d(&mut out.de, cfg.pe_bits, eid, ing, rr, NOLOC);
     });
-    for j in k.saturating_sub(RING)..k {
-        emit_e(cfg, links, t, &ring[j & (RING - 1)], out);
+    if let Some(links) = links {
+        for j in k.saturating_sub(RING)..k {
+            emit_e(cfg, links, t, &ring[j & (RING - 1)], out);
+        }
     }
 }
 
@@ -682,7 +692,7 @@ fn emit_c(cfg: &Cfg, links: &Links, t: u64, p: &PendC, out: &mut POut) {
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn parse_clicks(cfg: &Cfg, links: &Links, t: u64, base: *const u8, lo: usize, hi: usize, slot: usize, out: &mut POut) {
+unsafe fn parse_clicks(cfg: &Cfg, links: Option<&Links>, t: u64, base: *const u8, lo: usize, hi: usize, slot: usize, out: &mut POut) {
     let (cs, we) = (cfg.ws - WEEK_MS, cfg.we);
     let mut ring = [PendC::default(); RING];
     let mut k = 0usize;
@@ -711,19 +721,44 @@ unsafe fn parse_clicks(cfg: &Cfg, links: &Links, t: u64, base: *const u8, lo: us
             };
             let u = id_key(base.add(ua), ub - ua);
             let h = hk(u);
+            let pend = PendC { u, cid, h, ts, r: rr, camp };
+            let Some(links) = links else {
+                out.qc.push(pend);
+                return;
+            };
             links.prefetch(h);
             let s = k & (RING - 1);
             if k >= RING {
                 emit_c(cfg, links, t, &ring[s], out);
             }
-            ring[s] = PendC { u, cid, h, ts, r: rr, camp };
+            ring[s] = pend;
             k += 1;
             return;
         }
         push_d(&mut out.dc, cfg.pc_bits, cid, 0, rr, NOLOC);
     });
-    for j in k.saturating_sub(RING)..k {
-        emit_c(cfg, links, t, &ring[j & (RING - 1)], out);
+    if let Some(links) = links {
+        for j in k.saturating_sub(RING)..k {
+            emit_c(cfg, links, t, &ring[j & (RING - 1)], out);
+        }
+    }
+}
+
+/// Routes the rows a thread parsed before the link table was ready.
+fn drain_deferred(cfg: &Cfg, links: &Links, t: u64, out: &mut POut) {
+    let qe = std::mem::take(&mut out.qe);
+    for (i, p) in qe.iter().enumerate() {
+        if let Some(n) = qe.get(i + RING) {
+            links.prefetch(n.h);
+        }
+        emit_e(cfg, links, t, p, out);
+    }
+    let qc = std::mem::take(&mut out.qc);
+    for (i, p) in qc.iter().enumerate() {
+        if let Some(n) = qc.get(i + RING) {
+            links.prefetch(n.h);
+        }
+        emit_c(cfg, links, t, p, out);
     }
 }
 
@@ -1487,41 +1522,10 @@ fn main() {
     chunks(&ln_files, Kind::Events, &mut ltasks);
     let t_setup = t0.elapsed();
 
-    // ---- links: parse in parallel, join on one thread
-    let next = AtomicUsize::new(0);
-    let mut lparts: Vec<Vec<(u128, u128)>> = Vec::with_capacity(nt);
-    std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..nt.min(ltasks.len()).max(1))
-            .map(|_| {
-                let (ltasks, next, ln_files) = (&ltasks, &next, &ln_files);
-                sc.spawn(move || {
-                    let mut pairs: Vec<(u128, u128)> = Vec::new();
-                    let mut buf: Vec<u8> = Vec::with_capacity(CHUNK as usize + 8192);
-                    loop {
-                        let i = next.fetch_add(1, AO::Relaxed);
-                        if i >= ltasks.len() {
-                            break;
-                        }
-                        let tk = &ltasks[i];
-                        let (path, size) = &ln_files[tk.file];
-                        let mut f = File::open(path).unwrap_or_else(|e| panic!("open {}: {}", path.display(), e));
-                        let (lo, hi) = load_chunk(&mut f, tk.s, tk.e, *size, &mut buf);
-                        if lo < hi {
-                            unsafe { parse_links(buf.as_ptr(), lo, hi, &mut pairs) };
-                        }
-                    }
-                    pairs
-                })
-            })
-            .collect();
-        for h in hs {
-            lparts.push(h.join().expect("links thread"));
-        }
-    });
-    let links = build_links(&lparts);
-    let t_l = t0.elapsed();
-
-    // ---- stage A: parse, route each row to its person's partition
+    // ---- stage A: thread 0 builds the link table while the others parse;
+    // rows parsed before it is ready wait in a per-thread queue, then every
+    // row is routed to its person's partition.
+    let links: OnceLock<Links> = OnceLock::new();
     let next = AtomicUsize::new(0);
     let res_d = (est_ev as usize / (nt * npe)) * 5 / 4 + 32;
     let res_dc = (est_ck as usize / (nt * npc)) * 5 / 4 + 32;
@@ -1535,15 +1539,29 @@ fn main() {
         let hs: Vec<_> = (0..nt)
             .map(|t| {
                 let (cfg, tasks, next, links) = (&cfg, &tasks, &next, &links);
-                let (ev_files, ck_files) = (&ev_files, &ck_files);
+                let (ev_files, ck_files, ln_files, ltasks) = (&ev_files, &ck_files, &ln_files, &ltasks);
                 sc.spawn(move || {
                     let mut out = POut {
                         pe: (0..nq).map(|_| Vec::with_capacity(res_e)).collect(),
                         pc: (0..nq).map(|_| Vec::with_capacity(res_c)).collect(),
                         de: (0..npe).map(|_| Vec::with_capacity(res_d)).collect(),
                         dc: (0..npc).map(|_| Vec::with_capacity(res_dc)).collect(),
+                        qe: Vec::new(),
+                        qc: Vec::new(),
                     };
                     let mut buf: Vec<u8> = Vec::with_capacity(CHUNK as usize + 8192);
+                    if t == 0 {
+                        let mut pairs: Vec<(u128, u128)> = Vec::new();
+                        for tk in ltasks {
+                            let (path, size) = &ln_files[tk.file];
+                            let mut f = File::open(path).unwrap_or_else(|e| panic!("open {}: {}", path.display(), e));
+                            let (lo, hi) = load_chunk(&mut f, tk.s, tk.e, *size, &mut buf);
+                            if lo < hi {
+                                unsafe { parse_links(buf.as_ptr(), lo, hi, &mut pairs) };
+                            }
+                        }
+                        let _ = links.set(build_links(&[pairs]));
+                    }
                     loop {
                         let i = next.fetch_add(1, AO::Relaxed);
                         if i >= tasks.len() {
@@ -1560,12 +1578,16 @@ fn main() {
                             continue;
                         }
                         let base = buf.as_ptr();
+                        let lk = links.get();
                         unsafe {
                             match tk.kind {
-                                Kind::Events => parse_events(cfg, links, t as u64, base, lo, hi, tk.slot, &mut out),
-                                Kind::Clicks => parse_clicks(cfg, links, t as u64, base, lo, hi, tk.slot, &mut out),
+                                Kind::Events => parse_events(cfg, lk, t as u64, base, lo, hi, tk.slot, &mut out),
+                                Kind::Clicks => parse_clicks(cfg, lk, t as u64, base, lo, hi, tk.slot, &mut out),
                             }
                         }
+                    }
+                    if !out.qe.is_empty() || !out.qc.is_empty() {
+                        drain_deferred(cfg, links.wait(), t as u64, &mut out);
                     }
                     out
                 })
@@ -1780,9 +1802,9 @@ fn main() {
     let t_e = t0.elapsed();
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
-        "threads {} parts {}/{}/{} | setup {:.0} links {:.0} parse {:.0} dedup {:.0} sessions+write {:.0} campaigns {:.0} | total {:.0} ms | user rows {} campaign rows {}",
+        "threads {} parts {}/{}/{} | setup {:.0} parse {:.0} dedup {:.0} sessions+write {:.0} campaigns {:.0} | total {:.0} ms | user rows {} campaign rows {}",
         nt, npe, npc, nq,
-        ms(t_setup), ms(t_l - t_setup), ms(t_a - t_l), ms(t_b - t_a), ms(t_d - t_b), ms(t_e - t_d), ms(t_e),
+        ms(t_setup), ms(t_a - t_setup), ms(t_b - t_a), ms(t_d - t_b), ms(t_e - t_d), ms(t_e),
         total_rows, merged.len()
     );
     if let Ok(st) = fs::read_to_string("/proc/self/stat") {
