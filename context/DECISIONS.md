@@ -19,3 +19,15 @@ Status: accepted
 ## D-005 2026-11-21 Own stress generator instead of the official one
 Why: building/running the downloaded Rust generator was blocked by the auto-mode classifier. stress_gen.py targets the rules.md edge cases. Gap: no check against the official dev answer yet.
 Status: accepted until the user allows the generator
+
+## D-006 2026-11-21 Repo = starter/starter-duckdb, private until submit
+Why: Dockerfile must sit at repo root; context/ synced in via scripts/sync_context.sh. Private until the user okays going public (submission requires public).
+Status: accepted
+
+## D-007 2026-11-21 Parallel native Rust track (Fable) in native/
+Why: leaderboard tops ~0.65-1 s on 20M; Polars ~7.7 s on 2M locally. Rust toolchain already installed. Isolated dir, so no conflict with the single pipeline.py writer.
+Status: in progress
+
+## D-008 2026-11-21 Keep full Rust track despite research-engine-options "stop at <120 s"
+Why: the goal is rank, not passing; leaderboard tops are ~0.65-1 s on 20M. Fallback if full Rust stalls: hybrid d1 (Rust parse -> typed columns, Polars logic).
+Status: accepted

@@ -4,7 +4,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 mkdir -p context
-for f in STATUS.md DECISIONS.md CHANGELOG.md HANDOFF.md; do
+for f in STATUS.md DECISIONS.md CHANGELOG.md HANDOFF.md FAILURES.md; do
   cp "../../context/$f" "context/$f"
 done
 echo "synced context: $(ls context | tr '\n' ' ')"

@@ -10,3 +10,11 @@
 - 2026-11-21: Haiku moved Dockerfile/requirements/README/TEAM.md to Polars (polars 2.0.0, numpy 2.2.6, scipy 1.15.3, pyarrow 25.0.1).
 - 2026-11-21: Applied context/youtube best practices: added compact project CLAUDE.md; Haiku building scripts/verify.sh + .claude/skills/verify-pipeline skill; watching context/ for new notes.
 - 2026-11-21: Read agent-team-research.md + notes-A: plan = fresh read-only reviewer (correctness vs rules.md, no style nits) after Sonnet perf pass; lead waits for workers; short path+summary reports. Hook-gated verify deferred (too slow mid-edit).
+- 2026-11-21: Added context/best-practices.md and context/team-plan.md (from research-*.md, agent-team-research.md, youtube notes A/B/C); video batches 0-5 still being collected.
+- 2026-11-21: verify.sh landed (VERIFY PASS, 3m20s); added PIPE= override. git init in starter/starter-duckdb, .gitattributes '* -text' (fixtures keep \r; run.sh stays LF), commit bc5078e pushed to private github.com/AndrewPatton27/shopping-sessions.
+- 2026-11-21: Fable started native Rust pipeline in native/ (separate track); Haiku building scripts/bench.sh + bench/results.tsv; Sonnet pointed at research-performance.md priorities.
+- 2026-11-21: User allowed official generator. Built it; 1M dev set (seed 1) generated. reference.py AND pipeline.py both MATCH ans/dev-answer (117,038 user_daily rows, 27,400 campaign_daily rows).
+- 2026-11-21: User: repo stays private for now; submit at most 1/hour (blocked until public). Sonnet test-harness agent started (oracle sha256 guard, dev holdout, invariants, metamorphic, FAST mode, verify.log, bench lock) per research-testing.md + research-optimization-loop.md.
+- 2026-11-21: Merged video batches 0-5 themes into best-practices.md; added research-testing.md, research-optimization-loop.md, research-engine-options.md, drafts/ (agents, hooks; not installed). Rules audit still running.
+- 2026-11-21: Added context/FAILURES.md (best-practices §8: log and cluster agent failures).
+- 2026-11-21: Sonnet perf round 1 verified by lead (36/36, MATCH x3, dev MATCH): 2M ~7.7 s -> ~5.85 s (noisy). Committed.

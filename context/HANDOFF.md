@@ -18,7 +18,7 @@ Updated: 2026-11-21 by Opus lead.
 ## Do not retry
 - Capture-group regex for timestamps (6 s of 13 s on 2M).
 - winget rustup install (killed, exit 0xC000013A); rustup-init -y works.
-- Building/running gen/generator without user permission (classifier block).
+- (resolved) generator now allowed and built: gen/generator/target/release/generate.exe
 
 ## Resume
 `cd starter/starter-duckdb && bash scripts/verify.sh`. Nothing committed; no git repo for the entry yet.
