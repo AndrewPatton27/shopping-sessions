@@ -1,0 +1,11 @@
+# Local data and outputs (dataset is mounted at run time; never commit data)
+dev/
+out/
+stress/
+*.parquet
+*.csv
+!fixtures/**/*.csv
+__pycache__/
+*.pyc
+native/target/
+.claude/logs/
