@@ -163,8 +163,6 @@ pub struct Cal {
     /// Epoch day of the 1st of each month from January of y0.
     first: Vec<i64>,
     dim: Vec<u8>,
-    /// first << 5 | dim, for parse16's gather.
-    fd: Vec<i32>,
 }
 
 impl Cal {
@@ -191,8 +189,7 @@ impl Cal {
                 dim.push(if m == 2 && leap { 29 } else { MDAYS[(m - 1) as usize] as u8 });
             }
         }
-        let fd = first.iter().zip(&dim).map(|(&f, &d)| ((f as i32) << 5) | d as i32).collect();
-        Cal { y0, first, dim, fd }
+        Cal { y0, first, dim }
     }
 
     /// parse_ts of the n bytes at p. Requires 16 readable bytes at p.
@@ -218,159 +215,6 @@ impl Cal {
             return None;
         }
         Some((parse8(lo) * 100_000_000 + parse8(hi)) as i64)
-    }
-
-    /// parse (or, `trusted`, f1_trusted) of 16 fields at once: field i is the
-    /// n[i] bytes at base + a[i]. A lane's result is its epoch ms, i64::MIN
-    /// for None. Lanes the vector code does not settle (long digit runs,
-    /// dates outside the table, trusted values of another shape) are left to
-    /// the caller: their bits are set in the returned mask. Requires 32
-    /// readable bytes after each field start and 3 before it.
-    ///
-    /// Lane-parallel over the rows: F1/F2 bytes come from gathers at fixed
-    /// offsets, F3 digits from gathers ending at the field end; both forms are
-    /// computed for every lane and selected with masks, so no branch depends on
-    /// a row's form.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vbmi2,avx2")]
-    #[inline]
-    pub unsafe fn parse16(&self, base: *const u8, a: &[u32; 16], n: &[u32; 16], trusted: bool, out: &mut [i64; 16]) -> u16 {
-        use std::arch::x86_64::*;
-        let av = _mm512_loadu_si512(a.as_ptr() as *const _);
-        let nv = _mm512_loadu_si512(n.as_ptr() as *const _);
-        let s1 = |v: i32| _mm512_set1_epi32(v);
-        let z = _mm512_set1_epi8(b'0' as i8);
-        let ten = _mm512_set1_epi16(0x010A);
-        let hund = s1(100 | (1 << 16));
-        let lo16 = s1(0xFFFF);
-        let gp = base as *const i32;
-        macro_rules! g {
-            ($m:expr, $off:expr) => {
-                _mm512_mask_i32gather_epi32::<1>(z, $m, _mm512_add_epi32(av, s1($off)), gp)
-            };
-        }
-        // lanes with a byte under m (high bit per byte) that is not a digit
-        macro_rules! nd {
-            ($t:expr, $m:expr) => {
-                _mm512_test_epi32_mask(_mm512_adds_epu8($t, _mm512_set1_epi8(0x76)), s1($m as i32))
-            };
-        }
-        macro_rules! eq {
-            ($x:expr, $m:expr, $v:expr) => {
-                _mm512_cmpeq_epi32_mask(_mm512_and_si512($x, s1($m as i32)), s1($v as i32))
-            };
-        }
-        // a 2-digit pair's value from the low two bytes of t
-        macro_rules! p2 {
-            ($t:expr) => {
-                _mm512_and_si512(_mm512_maddubs_epi16($t, ten), lo16)
-            };
-        }
-        let all: __mmask16 = 0xFFFF;
-        // ---- F1 / F2: "YYYY-MM-DDTHH:MM:SS" + "Z" or "+HH:MM"
-        let xa = g!(all, 0);
-        let xb = g!(all, 4);
-        let xc = g!(all, 8);
-        let xd = g!(all, 12);
-        let xe = g!(all, 16);
-        let (ta, tb, tc, td, te) =
-            (_mm512_sub_epi8(xa, z), _mm512_sub_epi8(xb, z), _mm512_sub_epi8(xc, z), _mm512_sub_epi8(xd, z), _mm512_sub_epi8(xe, z));
-        let bad = nd!(ta, 0x8080_8080u32) | nd!(tb, 0x0080_8000u32) | nd!(tc, 0x8000_8080u32) | nd!(td, 0x8080_0080u32) | nd!(te, 0x0080_8000u32);
-        let seps = eq!(xb, 0xFF00_00FFu32, (b'-' as u32) | (b'-' as u32) << 24)
-            & eq!(xc, 0x00FF_0000u32, (b'T' as u32) << 16)
-            & eq!(xd, 0x0000_FF00u32, (b':' as u32) << 8)
-            & eq!(xe, 0x0000_00FFu32, b':' as u32);
-        let shape = seps & !bad;
-        let c19 = _mm512_srli_epi32::<24>(xe);
-        let n20 = _mm512_cmpeq_epi32_mask(nv, s1(20));
-        let n25 = _mm512_cmpeq_epi32_mask(nv, s1(25));
-        let is_z = n20 & _mm512_cmpeq_epi32_mask(c19, s1(b'Z' as i32));
-        let plus = _mm512_cmpeq_epi32_mask(c19, s1(b'+' as i32));
-        let is_pm = n25 & (plus | _mm512_cmpeq_epi32_mask(c19, s1(b'-' as i32)));
-        let y = _mm512_madd_epi16(_mm512_maddubs_epi16(ta, ten), hund);
-        let mo = p2!(_mm512_srli_epi32::<8>(tb));
-        let d = p2!(tc);
-        let h = p2!(_mm512_shrdi_epi32::<24>(tc, td));
-        let mi = p2!(_mm512_srli_epi32::<16>(td));
-        let se = p2!(_mm512_srli_epi32::<8>(te));
-        let k = _mm512_add_epi32(_mm512_mullo_epi32(_mm512_sub_epi32(y, s1(self.y0 as i32)), s1(12)), _mm512_sub_epi32(mo, s1(1)));
-        let kin = _mm512_cmplt_epu32_mask(k, s1(self.fd.len() as i32));
-        let tab = _mm512_mask_i32gather_epi32::<4>(_mm512_setzero_si512(), kin, k, self.fd.as_ptr());
-        let first = _mm512_srai_epi32::<5>(tab);
-        let dim = _mm512_and_si512(tab, s1(31));
-        let mut secs = _mm512_add_epi32(_mm512_mullo_epi32(_mm512_add_epi32(_mm512_mullo_epi32(h, s1(60)), mi), s1(60)), se);
-        let day = _mm512_add_epi32(first, _mm512_sub_epi32(d, s1(1)));
-        let iso_ok;
-        let slow;
-        if trusted {
-            iso_ok = n20 & shape & kin;
-            slow = !iso_ok;
-        } else {
-            let rng = _mm512_cmplt_epu32_mask(_mm512_sub_epi32(mo, s1(1)), s1(12))
-                & _mm512_cmplt_epu32_mask(h, s1(24))
-                & _mm512_cmplt_epu32_mask(mi, s1(60))
-                & _mm512_cmplt_epu32_mask(se, s1(60))
-                & _mm512_cmplt_epu32_mask(_mm512_sub_epi32(d, s1(1)), s1(31));
-            let mut ok = (is_z | is_pm) & shape & rng;
-            // F2 offset "+HH:MM": bytes 20..24 and 21..25
-            let xf = g!(is_pm, 20);
-            let xg = g!(is_pm, 21);
-            let (tf, tg) = (_mm512_sub_epi8(xf, z), _mm512_sub_epi8(xg, z));
-            let oh = p2!(tf);
-            let om = p2!(_mm512_srli_epi32::<16>(tg));
-            let off_ok = !(nd!(tf, 0x8000_8080u32) | nd!(tg, 0x8000_0000u32))
-                & eq!(xf, 0x00FF_0000u32, (b':' as u32) << 16)
-                & _mm512_cmplt_epu32_mask(oh, s1(24))
-                & _mm512_cmplt_epu32_mask(om, s1(60));
-            ok &= is_z | off_ok;
-            let off = _mm512_mullo_epi32(_mm512_add_epi32(_mm512_mullo_epi32(oh, s1(60)), om), s1(60));
-            // '+' subtracts the offset, '-' adds it
-            secs = _mm512_mask_sub_epi32(secs, is_pm & plus, secs, off);
-            secs = _mm512_mask_add_epi32(secs, is_pm & !plus, secs, off);
-            let dok = _mm512_cmple_epu32_mask(d, dim);
-            slow = (ok & !kin) | (_mm512_cmpgt_epu32_mask(nv, s1(16)) & !(is_z | is_pm));
-            iso_ok = ok & kin & dok;
-        }
-        // ---- F3: up to 16 digits, read as four 4-byte groups ending at the
-        // field end; bytes before the field start count as '0'
-        let mut q = [_mm512_setzero_si512(); 4];
-        let mut dok: __mmask16 = 0;
-        if !trusted {
-            let dig = _mm512_cmplt_epu32_mask(_mm512_sub_epi32(nv, s1(1)), s1(16));
-            let mut dbad: __mmask16 = 0;
-            for (j, qj) in q.iter_mut().enumerate() {
-                let j4 = 4 * j as i32;
-                let m = dig & _mm512_cmpgt_epu32_mask(nv, s1(j4));
-                let x = _mm512_mask_i32gather_epi32::<1>(z, m, _mm512_add_epi32(av, _mm512_sub_epi32(nv, s1(j4 + 4))), gp);
-                let sh = _mm512_slli_epi32::<3>(_mm512_max_epi32(_mm512_sub_epi32(s1(j4 + 4), nv), _mm512_setzero_si512()));
-                let keep = _mm512_sllv_epi32(s1(-1), sh);
-                // keep ? x : '0'
-                let x = _mm512_ternarylogic_epi32::<0xCA>(keep, x, z);
-                let t = _mm512_sub_epi8(x, z);
-                dbad |= nd!(t, 0x8080_8080u32);
-                *qj = _mm512_madd_epi16(_mm512_maddubs_epi16(t, ten), hund);
-            }
-            dok = dig & !dbad;
-        }
-        let hi8 = _mm512_add_epi32(_mm512_mullo_epi32(q[3], s1(10_000)), q[2]);
-        let lo8 = _mm512_add_epi32(_mm512_mullo_epi32(q[1], s1(10_000)), q[0]);
-        // ---- to i64, 8 lanes per half
-        let none = _mm512_set1_epi64(i64::MIN);
-        let (dl, dh) = (_mm512_castsi512_si256(day), _mm512_extracti64x4_epi64::<1>(day));
-        let (sl, sh) = (_mm512_castsi512_si256(secs), _mm512_extracti64x4_epi64::<1>(secs));
-        let (hl, hh) = (_mm512_castsi512_si256(hi8), _mm512_extracti64x4_epi64::<1>(hi8));
-        let (ll, lh) = (_mm512_castsi512_si256(lo8), _mm512_extracti64x4_epi64::<1>(lo8));
-        for (half, (dv, sv, hv, lv)) in [(dl, sl, hl, ll), (dh, sh, hh, lh)].into_iter().enumerate() {
-            let ms = _mm512_add_epi64(
-                _mm512_mul_epi32(_mm512_cvtepi32_epi64(dv), _mm512_set1_epi64(DAY_MS)),
-                _mm512_mul_epi32(_mm512_cvtepi32_epi64(sv), _mm512_set1_epi64(1000)),
-            );
-            let num = _mm512_add_epi64(_mm512_mul_epu32(_mm512_cvtepu32_epi64(hv), _mm512_set1_epi64(100_000_000)), _mm512_cvtepu32_epi64(lv));
-            let sh8 = 8 * half as u32;
-            let r = _mm512_mask_mov_epi64(_mm512_mask_mov_epi64(none, (dok >> sh8) as u8, num), (iso_ok >> sh8) as u8, ms);
-            _mm512_storeu_si512(out.as_mut_ptr().add(8 * half) as *mut _, r);
-        }
-        slow
     }
 
     /// Epoch day of year y, month mo (1..=12), day d; None for an impossible date.
