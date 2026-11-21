@@ -1192,7 +1192,9 @@ impl Local {
 
 #[derive(Default)]
 struct DBufs {
-    ids: Vec<u32>,
+    /// (event, person id) of the partition's live events, read once from the
+    /// partition so the scatter below works from cache, not DRAM.
+    tmp: Vec<(E16, u32)>,
     cids: Vec<u32>,
     off: Vec<u32>,
     coff: Vec<u32>,
@@ -1207,7 +1209,7 @@ fn do_part(q: usize, pes: &[Vec<Vec<Ev>>], pcs: &[Vec<Vec<Ck>>], local: &mut Loc
     }
     assert!(n < u32::MAX as usize);
     local.reset(n);
-    b.ids.clear();
+    b.tmp.clear();
     b.off.clear();
     for c in pes {
         for e in c[q].iter().filter(|e| e.price != INVALID) {
@@ -1216,10 +1218,10 @@ fn do_part(q: usize, pes: &[Vec<Vec<Ev>>], pcs: &[Vec<Vec<Ck>>], local: &mut Loc
                 b.off.push(0);
             }
             b.off[id as usize] += 1;
-            b.ids.push(id);
+            b.tmp.push((E16 { ts: e.ts, price: e.price, cat: e.cat }, id));
         }
     }
-    let n = b.ids.len();
+    let n = b.tmp.len();
     if n == 0 {
         return;
     }
@@ -1234,15 +1236,10 @@ fn do_part(q: usize, pes: &[Vec<Vec<Ev>>], pcs: &[Vec<Vec<Ck>>], local: &mut Loc
     b.off.push(acc);
     b.evs.clear();
     b.evs.resize(n, E16::default());
-    let mut k = 0usize;
-    for c in pes {
-        for e in c[q].iter().filter(|e| e.price != INVALID) {
-            let id = b.ids[k] as usize;
-            k += 1;
-            let pos = b.off[id];
-            b.off[id] = pos + 1;
-            b.evs[pos as usize] = E16 { ts: e.ts, price: e.price, cat: e.cat };
-        }
+    for &(e, id) in &b.tmp {
+        let pos = b.off[id as usize];
+        b.off[id as usize] = pos + 1;
+        b.evs[pos as usize] = e;
     }
     // off[id] is now the end of person id; the start is off[id-1] (or 0)
 
