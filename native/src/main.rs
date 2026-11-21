@@ -295,8 +295,11 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
 
 /// Calls `row` with the NF fields (start, end offsets from `base`, quotes
 /// stripped) of every well-formed line starting in [lo, hi). Requires
-/// base[hi] == b'\n' and 128 readable bytes after it (the timestamp parser
-/// reads up to 16 bytes from the start of a field).
+/// base[hi] == b'\n' and 128 readable bytes after it.
+///
+/// Lines shorter than 128 bytes (all of them, in practice) take a branch-free
+/// path: one 128-byte mask, NF-1 unrolled comma extractions, and quote
+/// stripping by arithmetic. Longer lines walk 64 bytes at a time.
 #[inline(always)]
 unsafe fn scan_lines<const NF: usize>(
     base: *const u8,
@@ -307,29 +310,49 @@ unsafe fn scan_lines<const NF: usize>(
     let mut pos = lo;
     while pos < hi {
         let mut ends = [0usize; NF];
-        let mut nf = 0usize;
-        let mut qc = 0u32;
-        let mut off = pos;
-        let nl;
-        loop {
-            let (cm, nm, qm) = masks64(base.add(off));
-            let below = if nm != 0 { (nm & nm.wrapping_neg()) - 1 } else { !0 };
-            let mut c = cm & below;
-            qc += (qm & below).count_ones();
-            while c != 0 {
-                if nf < NF - 1 {
-                    ends[nf] = off + c.trailing_zeros() as usize;
-                }
-                nf += 1;
-                c &= c - 1;
-            }
-            if nm != 0 {
-                nl = off + nm.trailing_zeros() as usize;
-                break;
-            }
-            off += 64;
-        }
         let start = pos;
+        let nl;
+        let nf;
+        let qc;
+        let (c0, n0, q0) = masks64(base.add(pos));
+        let (c1, n1, q1) = masks64(base.add(pos + 64));
+        let n = (n0 as u128) | ((n1 as u128) << 64);
+        if n != 0 {
+            let z = n.trailing_zeros();
+            let below = (1u128 << z) - 1;
+            let mut c = ((c0 as u128) | ((c1 as u128) << 64)) & below;
+            qc = (((q0 as u128) | ((q1 as u128) << 64)) & below).count_ones();
+            nf = c.count_ones() as usize;
+            nl = pos + z as usize;
+            for e in ends.iter_mut().take(NF - 1) {
+                *e = pos + c.trailing_zeros() as usize;
+                c &= c.wrapping_sub(1);
+            }
+        } else {
+            let mut cnt = 0usize;
+            let mut q = 0u32;
+            let mut off = pos;
+            loop {
+                let (cm, nm, qm) = masks64(base.add(off));
+                let below = if nm != 0 { (nm & nm.wrapping_neg()) - 1 } else { !0 };
+                let mut c = cm & below;
+                q += (qm & below).count_ones();
+                while c != 0 {
+                    if cnt < NF - 1 {
+                        ends[cnt] = off + c.trailing_zeros() as usize;
+                    }
+                    cnt += 1;
+                    c &= c - 1;
+                }
+                if nm != 0 {
+                    nl = off + nm.trailing_zeros() as usize;
+                    break;
+                }
+                off += 64;
+            }
+            nf = cnt;
+            qc = q;
+        }
         pos = nl + 1;
         if nf != NF - 1 {
             continue;
@@ -345,10 +368,9 @@ unsafe fn scan_lines<const NF: usize>(
             let mut wrapped = 0u32;
             for x in f.iter_mut() {
                 let (a, b) = *x;
-                if b - a >= 2 && *base.add(a) == b'"' && *base.add(b - 1) == b'"' {
-                    *x = (a + 1, b - 1);
-                    wrapped += 1;
-                }
+                let w = ((b >= a + 2) & (*base.add(a) == b'"') & (*base.add(b.max(1) - 1) == b'"')) as usize;
+                *x = (a + w, b - w);
+                wrapped += w as u32;
             }
             if qc != 2 * wrapped {
                 continue;
