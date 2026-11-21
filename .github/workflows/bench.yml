@@ -87,8 +87,22 @@ jobs:
             echo "| Native peak RSS (kB) | ${peak} |"
             echo "| Docker run wall (ms) | ${docker_ms} |"
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Knob variants (modes = knobs:a,b,...)
+        if: startsWith(inputs.modes, 'knobs:')
+        env:
+          MODES: ${{ inputs.modes }}
+        run: |
+          lscpu | grep -E "Model name|L2|L3"
+          V=$(echo "${MODES#knobs:}" | tr ',' ' ')
+          for round in 1 2 3 4 5; do
+            for k in $V; do
+              echo "KNOB $k $(KNOBS=$k DATA_DIR=/tmp/data OUTPUT_DIR=/tmp/ok_$k NCPU=$(nproc) native/target/release/shopping-sessions 2>&1 | head -1 | grep -o 'parse.*total [0-9]* ms')"
+            done
+          done
+          pip install -q polars==2.0.0 pyarrow==25.0.1
+          for k in $V; do (cd scripts && python compare.py /tmp/ok_$k /tmp/ok_$(echo $V | cut -d' ' -f1) | tail -1); done
       - name: Modes A/B (scorer emulation)
-        if: inputs.modes != '' && inputs.modes != 'perf'
+        if: inputs.modes != '' && inputs.modes != 'perf' && !startsWith(inputs.modes, 'knobs:')
         env:
           MODES: ${{ inputs.modes }}
           BASE: ${{ inputs.base }}
