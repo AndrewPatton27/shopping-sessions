@@ -118,7 +118,7 @@ jobs:
                         one "MODE cold $side" $B 0-3 4 /tmp/o_$side ;;
                   warm3) one "MODE warm3 $side" $B 0-2 3 /tmp/o_$side ;;
                   hog) taskset -c 3 /tmp/hog & H=$!; sleep 0.3
-                       one "MODE hog $side" $B 0-2 3 /tmp/o_$side; kill $H; wait $H 2>/dev/null ;;
+                       one "MODE hog $side" $B 0-2 3 /tmp/o_$side; kill $H; wait $H 2>/dev/null || true ;;
                   twin) one "MODE twin-a $side" $B 0-1 2 /tmp/o_$side & one "MODE twin-b $side" $B 2-3 2 /tmp/o2_$side; wait ;;
                   solo2) one "MODE solo2 $side" $B 0-1 2 /tmp/o_$side ;;
                 esac
