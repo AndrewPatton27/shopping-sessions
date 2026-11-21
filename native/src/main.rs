@@ -743,6 +743,16 @@ struct Links {
     cap: usize,
     bits: Vec<u64>,
     bmask: u64,
+    bk: Vec<Bucket>,
+}
+
+/// Knob k: 4 keys and their values per cache line; lookups compare all four
+/// without branching on the outcome.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Bucket {
+    k: [u64; 4],
+    v: [u64; 4],
 }
 
 impl Links {
@@ -754,6 +764,36 @@ impl Links {
     fn maybe(&self, h: u64) -> bool {
         let b = h & self.bmask;
         unsafe { (*self.bits.get_unchecked((b >> 6) as usize) >> (b & 63)) & 1 != 0 }
+    }
+    #[inline(always)]
+    fn bhome(&self, h: u64) -> usize {
+        ((h as u128 * self.bk.len() as u128) >> 64) as usize
+    }
+    #[inline(always)]
+    fn prefetch_b(&self, h: u64) {
+        if self.cap != 0 {
+            prefetch(unsafe { self.bk.as_ptr().add(self.bhome(h)) });
+        }
+    }
+    #[inline(always)]
+    fn lookup_b(&self, k: u64, h: u64) -> u64 {
+        if self.cap == 0 {
+            return k;
+        }
+        let mut b = self.bhome(h);
+        loop {
+            let bk = unsafe { self.bk.get_unchecked(b) };
+            let m = (bk.k[0] == k) as u32 | ((bk.k[1] == k) as u32) << 1 | ((bk.k[2] == k) as u32) << 2 | ((bk.k[3] == k) as u32) << 3;
+            let z = (bk.k[0] == 0) as u32 | ((bk.k[1] == 0) as u32) << 1 | ((bk.k[2] == 0) as u32) << 2 | ((bk.k[3] == 0) as u32) << 3;
+            if (m | z) != 0 {
+                let v = bk.v[(m.trailing_zeros() & 3) as usize];
+                return if m != 0 { v } else { k };
+            }
+            b += 1;
+            if b == self.bk.len() {
+                b = 0;
+            }
+        }
     }
     #[inline(always)]
     fn prefetch(&self, h: u64) {
@@ -800,7 +840,7 @@ unsafe fn parse_links(base: *const u8, lo: usize, hi: usize, pairs: &mut Vec<(u6
 fn build_links(pairs: &[(u64, u64)]) -> Links {
     let np = pairs.len();
     if np == 0 {
-        return Links { slots: Vec::new(), cap: 0, bits: Vec::new(), bmask: 0 };
+        return Links { slots: Vec::new(), cap: 0, bits: Vec::new(), bmask: 0, bk: Vec::new() };
     }
     let cap = (np * 2 + np / 2).max(16).next_power_of_two();
     let mask = cap - 1;
@@ -872,7 +912,24 @@ fn build_links(pairs: &[(u64, u64)]) -> Links {
     }
     let cap = (moved.len() * 5 / 2).max(16);
     let nbits = (moved.len() * 16).max(64).next_power_of_two();
-    let mut out = Links { slots: vec![(0u64, 0u64); cap], cap, bits: vec![0u64; nbits / 64], bmask: nbits as u64 - 1 };
+    let nbk = (moved.len() / 2).max(4);
+    let mut out = Links { slots: vec![(0u64, 0u64); cap], cap, bits: vec![0u64; nbits / 64], bmask: nbits as u64 - 1, bk: vec![Bucket { k: [0; 4], v: [0; 4] }; nbk] };
+    for &(k, v) in &moved {
+        let mut b = ((mix(k) as u128 * nbk as u128) >> 64) as usize;
+        'ins: loop {
+            for i in 0..4 {
+                if out.bk[b].k[i] == 0 {
+                    out.bk[b].k[i] = k;
+                    out.bk[b].v[i] = v;
+                    break 'ins;
+                }
+            }
+            b += 1;
+            if b == nbk {
+                b = 0;
+            }
+        }
+    }
     for &(k, v) in &moved {
         let h = mix(k);
         let b = h & out.bmask;
@@ -999,6 +1056,7 @@ static KE: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('e'));
 static KL: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('l'));
 static KB: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('b'));
 static KLOOK: LazyLock<usize> = LazyLock::new(|| if KNOBS.contains('w') { 64 } else if KNOBS.contains('v') { 32 } else { 16 });
+static KK: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('k'));
 static KD: LazyLock<bool> = LazyLock::new(|| KNOBS.contains('d'));
 
 unsafe fn route_ev(segs: &[(Ptr<ERec>, usize)], links: &Links, qb: u32, out: &mut Parts<PRec>) {
@@ -1006,6 +1064,23 @@ unsafe fn route_ev(segs: &[(Ptr<ERec>, usize)], links: &Links, qb: u32, out: &mu
         return route_ev_b(segs, links, qb, out);
     }
     let look = *KLOOK;
+    if *KK {
+        for &(ptr, len) in segs {
+            let p = ptr.0;
+            for i in 0..len {
+                if i + look < len {
+                    links.prefetch_b(mix((*p.add(i + look)).user));
+                }
+                let r = *p.add(i);
+                if r.ts == DEAD {
+                    continue;
+                }
+                let person = links.lookup_b(r.user, mix(r.user));
+                out.push(part_of(mix(person), qb), PRec { person, key: ((r.ts as u64) << 32) | r.pc as u64 });
+            }
+        }
+        return;
+    }
     for &(ptr, len) in segs {
         let p = ptr.0;
         for i in 0..len {
@@ -1059,15 +1134,21 @@ unsafe fn route_ck(segs: &[(Ptr<CRec>, usize)], links: &Links, qb: u32, out: &mu
         let p = ptr.0;
         for i in 0..len {
             if i + look < len {
-                links.prefetch(mix((*p.add(i + look)).user));
+                let h = mix((*p.add(i + look)).user);
+                if *KK { links.prefetch_b(h) } else { links.prefetch(h) }
             }
             let r = *p.add(i);
             if r.camp == DEAD {
                 continue;
             }
-            let hu = mix(r.user);
-            let person = links.lookup(r.user, hu);
-            let hp = if person == r.user { hu } else { mix(person) };
+            let (person, hp) = if *KK {
+                let person = links.lookup_b(r.user, mix(r.user));
+                (person, mix(person))
+            } else {
+                let hu = mix(r.user);
+                let person = links.lookup(r.user, hu);
+                (person, if person == r.user { hu } else { mix(person) })
+            };
             out.push(part_of(hp, qb), PCk { person, cid: r.cid, ts: r.ts, camp: r.camp });
         }
     }
