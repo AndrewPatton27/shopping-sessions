@@ -34,5 +34,9 @@ Status: accepted
 
 ## D-009 2026-11-21 No paid credits: plan usage only
 Why: user order. Extra usage is enabled on the account ($18.49 of $20 spent), and it only kicks in after the 5-hour limit fills.
-Rule: lead checks get_usage at every checkpoint. 5-hour >= 75%: no new Opus/Fable agents, cheap tier or Codex only (per codex-fallback memory). >= 88%: stop all agents, wait for the reset.
+Rule: lead checks get_usage at every checkpoint. 5-hour >= 75%: no new Opus/Fable agents, cheap tier or Codex only (per codex-fallback memory). >= 95% (user-set, was 88%): stop all agents, wait for the reset.
 Status: accepted
+
+## D-010 2026-11-21 Fable banned for this project
+Why: paid extra usage rose $1.82 to the $20 cap while Fable ran; Fable stopped on a spend-limit 429. User forbids paid credits.
+Status: accepted. Native Rust track continues only on Sonnet (plan-covered), if at all.
