@@ -10,3 +10,4 @@ __pycache__/
 native/target/
 .claude/logs/
 bench/verify.log
+native/target-v3/

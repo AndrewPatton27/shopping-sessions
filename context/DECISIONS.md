@@ -40,3 +40,8 @@ Status: accepted
 ## D-010 2026-11-21 Fable banned for this project
 Why: paid extra usage rose $1.82 to the $20 cap while Fable ran; Fable stopped on a spend-limit 429. User forbids paid credits.
 Status: accepted. Native Rust track continues only on Sonnet (plan-covered), if at all.
+
+## D-011 2026-11-21 Ship the native Rust binary
+Why: identical output on every check (fixtures, regress, official dev, seeds, metamorphic, 10M vs Polars) and ~8x faster than Polars at 10M (0.9 s vs 7.8 s). Build with x86-64-v3 (AVX2) since scorers are AVX-512 Xeons; AVX2 path verified locally.
+Risks: 37 unsafe blocks (reviewer audit pending); Docker image never built locally; Polars fallback kept as Dockerfile.polars.
+Status: accepted

@@ -1,0 +1,4 @@
+# The scorers are Intel Xeon (AVX2 since Haswell, 2013). x86-64-v3 enables the
+# AVX2 line tokenizer; without it the code falls back to SSE2 at compile time.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

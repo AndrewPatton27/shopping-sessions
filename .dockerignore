@@ -3,3 +3,6 @@ dev/
 out/
 *.md
 .git
+native/target/
+native/target-v3/
+native/src/*.bak

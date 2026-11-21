@@ -24,3 +24,4 @@
 - 2026-11-21: User: no paid credits. 5-hour usage 39% (resets 10:20Z). Usage gate rule D-009.
 - 2026-11-21: regress/R1-R4 committed (window overflow, \r vs \x10 order, \x1e, \x1f); old pipeline fails all 4, reference passes 4/4.
 - 2026-11-21: Sonnet round 2 verified by lead (VERIFY PASS full: oracle, 36/36, regress 4/4, dev MATCH 2.1 s, seeds MATCH, invariants). 10M 25.9 s -> 9.5 s, peak RSS 6.5 -> 2.8 GB. Committed. Agent defs installed (.claude/agents, project root, not in repo).
+- 2026-11-21: Native Rust (Fable, std-only) verified by lead: full verify + META PASS (default and x86-64-v3 builds), dev 0.1 s, 10M 0.9-1.0 s vs Polars 7.8 s, 10M output MATCH Polars. Linux target cargo check OK. Dockerfile switched to Rust multi-stage; Polars kept as Dockerfile.polars. Image unbuilt (no Docker).
