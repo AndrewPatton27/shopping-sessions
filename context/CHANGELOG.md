@@ -67,3 +67,5 @@
 - 2026-11-21: Peer exp-rec2 patch (positional purchase join, 4 B PurRec): exact, no local gain; rejected. Record-size path closed (scorer showed no gain for 24 B records).
 - 2026-11-21: exp-simd merged (two-stage AVX-512 parse: vpcompressb field offsets, 16-lane batch ts/ingest/ID parse with scalar fallback; AVX2 path unchanged). CI same-run 20M -9% (943 vs 1038). verify-linux CI with AVX-512 active: full verify + META + 400 fuzz PASS. Local AVX2: META+fuzz, 10M+60M MATCH (agent).
 - 2026-11-21: BB-A1BC8FC9 (exp-simd) 0.8593 s vs best 0.84: AVX-512 path slower on scorer despite CI -9% (possible AVX-512 downclock on Xeon or feature mismatch). Reverted on main. Board now shows 4 decimals.
+- 2026-11-21: exp-simd2 (AVX2-only 8-lane batch) slower on CI (+5-6% parse); dropped. Next: exp-simd3 = AVX-512VL 256-bit variant (avoid Xeon zmm downclock) as one scorer test. Note: scorer hides logs, flag prints useless.
+- 2026-11-22: exp-simd3 (AVX-512VL ymm-only): -6% on one AVX-512 runner, equal on another; behind exp-simd zmm (-19%). Skipped scorer slot. SIMD path closed.
